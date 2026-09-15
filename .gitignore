@@ -32,9 +32,11 @@ wheels/
 .coverage
 htmlcov/
 
-# Logs
+# Logs & Runtime Events
 *.log
 logs/
+events/*.jsonl
+!events/.gitkeep
 
 # IDE
 .idea/
@@ -45,3 +47,4 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+

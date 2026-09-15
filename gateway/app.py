@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -9,9 +10,17 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from gateway.auth_engine import auth_engine
 from gateway.config import config
+from gateway.credential_defense import credential_defense
 from gateway.rate_limiter import RateLimiter
+from gateway.replay_guard import replay_guard
 from gateway.risk_engine import Decision, RiskScore, calculate_risk
+from gateway.route_allowlist import route_allowlist
+from gateway.schemas import LoginSchema, OrderCreateSchema
+from gateway.telemetry.anti_poisoning import anti_poisoning_filter
+from gateway.telemetry.event_pipeline import telemetry_pipeline
+from gateway.telemetry.redaction import pseudonymize_identifier, sanitize_telemetry
 from gateway.waf import inspect_content
 
 # Logging configuration
@@ -29,24 +38,35 @@ rate_limiter = RateLimiter(
     redis_timeout=config.redis_timeout
 )
 
-import asyncio
-
 # Persistent HTTP Client with connection pooling for proxying
 http_client: Optional[httpx.AsyncClient] = None
-_client_loop = None
 
 def get_http_client() -> httpx.AsyncClient:
     global http_client
+    loop = None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    recreate = False
     if http_client is None or http_client.is_closed:
+        recreate = True
+    elif hasattr(http_client, "_loop") and http_client._loop is not None and (http_client._loop.is_closed() or (loop is not None and http_client._loop != loop)):
+        recreate = True
+
+    if recreate:
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0),
             limits=httpx.Limits(max_keepalive_connections=100, max_connections=200)
         )
+        http_client._loop = loop
     return http_client
+
 
 app = FastAPI(
     title="ERP Security Gateway",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url=None
 )
@@ -63,36 +83,19 @@ async def shutdown_event():
         await http_client.aclose()
         logger.info("Security Gateway HTTP pool closed.")
 
-def verify_jwt_token(auth_header: str) -> tuple[bool, str, float, float]:
-    """
-    Validates Authorization Bearer token structure and claims.
-    Returns: (is_valid, reason, auth_anomaly_score_0_to_100, user_trust_0_to_1)
-    """
-    if not auth_header:
-        return False, "Missing Authorization header", 85.0, 0.0
-        
-    if not auth_header.startswith("Bearer "):
-        return False, "Invalid Authorization scheme (Bearer required)", 80.0, 0.0
-        
-    token = auth_header[7:].strip()
-    parts = token.split(".")
-    if len(parts) != 3:
-        return False, "Malformed JWT structure (must contain header.payload.signature)", 100.0, 0.0
-        
-    # Valid structural token
-    return True, "Valid JWT format", 0.0, 1.0
-
 def emit_audit_event(
     request_id: str,
     decision: Decision,
     risk_score: RiskScore,
     request: Request,
     latency_ms: float,
-    client_ip: str
+    client_ip: str,
+    principal: str = ""
 ):
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": request_id,
+        "principal_ref": pseudonymize_identifier(principal or client_ip),
         "client_ip": client_ip,
         "method": request.method,
         "path": request.url.path,
@@ -103,8 +106,17 @@ def emit_audit_event(
         "latency_ms": round(latency_ms, 2),
         "user_agent": request.headers.get("User-Agent", "unknown")
     }
-    # Emits structured JSON line
-    audit_logger.info(json.dumps(event))
+    # Scrub any accidental PII before serialization
+    sanitized_event = sanitize_telemetry(event)
+    
+    # 1. Local structured logger
+    audit_logger.info(json.dumps(sanitized_event))
+    
+    # 2. Asynchronous Guaranteed Telemetry Pipeline (Phase 3)
+    telemetry_pipeline.emit(sanitized_event)
+    
+    # 3. Anti-Poisoning Quarantine Routing (Phase 3)
+    anti_poisoning_filter.process_event(sanitized_event)
 
 @app.get("/health")
 async def health_check():
@@ -112,6 +124,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "erp-security-gateway",
+        "version": "2.0.0",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -123,7 +136,7 @@ async def security_pipeline_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = request_id
     
-    # Health endpoint bypasses inspection
+    # Health endpoint bypasses security pipeline
     if request.url.path == "/health":
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -131,7 +144,7 @@ async def security_pipeline_middleware(request: Request, call_next):
 
     client_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "127.0.0.1")
     reasons = []
-    
+
     # 2. Oversized payload verification
     content_length = request.headers.get("Content-Length")
     if content_length:
@@ -148,20 +161,39 @@ async def security_pipeline_middleware(request: Request, call_next):
                 emit_audit_event(request_id, Decision.BLOCK, risk, request, (time.time() - start_time) * 1000, client_ip)
                 return JSONResponse(
                     status_code=413,
+                    headers={"X-Request-ID": request_id, "X-Decision": "BLOCK"},
                     content={"error": "Payload Too Large", "request_id": request_id, "message": "Request exceeds maximum permitted size"}
                 )
         except ValueError:
             pass
 
-    # Read body for inspection while preserving stream for proxying
+    # Read body for inspection while preserving receive channel for proxying
     body_bytes = await request.body()
     async def receive():
         return {"type": "http.request", "body": body_bytes}
     request._receive = receive
     body_text = body_bytes.decode("utf-8", errors="ignore") if body_bytes else ""
-    
-    # 3. WAF Inspection (Path, Query String, and Body)
-    waf_severity = 0.0
+
+    # 3. Credential Defense Status Check (Brute-force velocity lockout)
+    is_brute_force, cred_threat, cred_reasons = credential_defense.check_status(client_ip)
+    if is_brute_force:
+        reasons.extend(cred_reasons)
+        risk = calculate_risk(
+            waf_severity=float(cred_threat),
+            auth_anomaly=0.0,
+            rate_severity=80.0,
+            path=request.url.path,
+            extra_reasons=reasons
+        )
+        emit_audit_event(request_id, Decision.BLOCK, risk, request, (time.time() - start_time) * 1000, client_ip)
+        return JSONResponse(
+            status_code=403,
+            headers={"X-Request-ID": request_id, "X-Decision": "BLOCK", "X-Risk-Score": str(risk.overall)},
+            content={"error": "Forbidden", "request_id": request_id, "message": "Access temporarily locked due to repeated authentication failures", "reasons": reasons}
+        )
+
+    # 4. WAF Inspection (Inspect raw URL and body for SQLi, XSS, Path Traversal)
+    waf_severity = float(cred_threat)
     is_path_attack, path_reasons, path_score = inspect_content(str(request.url))
     if is_path_attack:
         waf_severity = max(waf_severity, float(path_score))
@@ -173,25 +205,118 @@ async def security_pipeline_middleware(request: Request, call_next):
             waf_severity = max(waf_severity, float(body_score))
             reasons.extend(body_reasons)
 
-    # 4. Authentication Inspection
+    if is_path_attack or (body_text and is_body_attack):
+        risk = calculate_risk(
+            waf_severity=waf_severity,
+            auth_anomaly=0.0,
+            rate_severity=0.0,
+            path=request.url.path,
+            extra_reasons=reasons
+        )
+        emit_audit_event(request_id, Decision.BLOCK, risk, request, (time.time() - start_time) * 1000, client_ip)
+        return JSONResponse(
+            status_code=403,
+            headers={
+                "X-Request-ID": request_id,
+                "X-Decision": "BLOCK",
+                "X-Risk-Score": str(risk.overall)
+            },
+            content={
+                "error": "Forbidden",
+                "request_id": request_id,
+                "message": "Request blocked by ERP Security Gateway policy",
+                "risk_score": risk.overall,
+                "reasons": risk.reasons
+            }
+        )
+
+    # 5. Route Allowlisting Check
+    is_known, is_method_allowed, matching_rule, route_reason = route_allowlist.validate_route(
+        request.url.path, request.method
+    )
+    if not is_known:
+        return JSONResponse(
+            status_code=404,
+            headers={"X-Request-ID": request_id, "X-Decision": "BLOCK"},
+            content={"error": "Not Found", "request_id": request_id, "message": route_reason}
+        )
+    if not is_method_allowed:
+        return JSONResponse(
+            status_code=405,
+            headers={"X-Request-ID": request_id, "X-Decision": "BLOCK"},
+            content={"error": "Method Not Allowed", "request_id": request_id, "message": route_reason}
+        )
+
+    # 6. JSON Schema Validation
+    if request.method in ["POST", "PUT"] and body_text:
+        try:
+            payload = json.loads(body_text)
+            if request.url.path == "/api/auth/login":
+                LoginSchema(**payload)
+            elif request.url.path == "/api/orders":
+                OrderCreateSchema(**payload)
+        except json.JSONDecodeError:
+            return JSONResponse(
+                status_code=400,
+                headers={"X-Request-ID": request_id, "X-Decision": "BLOCK"},
+                content={"error": "Bad Request", "request_id": request_id, "message": "Malformed JSON in request body"}
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=422,
+                headers={"X-Request-ID": request_id, "X-Decision": "BLOCK"},
+                content={"error": "Unprocessable Entity", "request_id": request_id, "message": f"Schema validation failed: {e}"}
+            )
+
+    # 7. Replay Protection Guard
+    if request.method in ["POST", "PUT", "DELETE"]:
+        nonce = request.headers.get("X-Nonce")
+        timestamp_str = request.headers.get("X-Timestamp")
+        is_replay, replay_threat, replay_reasons = replay_guard.validate_request(nonce, timestamp_str, body_bytes)
+        if is_replay:
+            reasons.extend(replay_reasons)
+            waf_severity = max(waf_severity, replay_threat)
+            risk = calculate_risk(
+                waf_severity=waf_severity,
+                auth_anomaly=0.0,
+                rate_severity=50.0,
+                path=request.url.path,
+                extra_reasons=reasons
+            )
+            emit_audit_event(request_id, Decision.BLOCK, risk, request, (time.time() - start_time) * 1000, client_ip)
+            return JSONResponse(
+                status_code=403,
+                headers={"X-Request-ID": request_id, "X-Decision": "BLOCK", "X-Risk-Score": str(risk.overall)},
+                content={"error": "Forbidden", "request_id": request_id, "message": "Replay attack detected or timestamp outside valid window", "reasons": reasons}
+            )
+
+    # 8. Cryptographic JWT & BOLA/IDOR Authorization
     auth_header = request.headers.get("Authorization", "")
     is_auth_exempt = request.url.path in ["/health", "/api/auth/login"]
+    user_principal = ""
     
     if is_auth_exempt:
         auth_anomaly = 0.0
         user_trust = 0.85
     else:
-        is_token_valid, auth_reason, auth_anomaly, user_trust = verify_jwt_token(auth_header)
+        is_token_valid, auth_reason, claims, auth_anomaly, user_trust = auth_engine.decode_and_verify(auth_header)
         if not is_token_valid:
             reasons.append(auth_reason)
+        else:
+            user_principal = str(claims.get("sub", ""))
+            # BOLA/IDOR Context Check
+            is_authorized, bola_reason = auth_engine.check_bola_idor(request.url.path, claims)
+            if not is_authorized:
+                reasons.append(bola_reason)
+                waf_severity = max(waf_severity, 95.0)  # Hard block IDOR tampering
 
-    # 5. Rate Limiting Check
+    # 9. Rate Limiting Check
     rate_key = client_ip
     count, rate_severity = rate_limiter.check_rate(rate_key)
     if rate_severity > 50:
         reasons.append(f"Elevated request rate detected: {count} req/min")
 
-    # 6. Calculate Bounded Risk Score & Decision
+    # 10. Calculate Bounded Risk Score & Decision
     risk_score = calculate_risk(
         waf_severity=waf_severity,
         auth_anomaly=auth_anomaly,
@@ -202,9 +327,10 @@ async def security_pipeline_middleware(request: Request, call_next):
     )
 
     elapsed_ms = (time.time() - start_time) * 1000
-    emit_audit_event(request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip)
+    emit_audit_event(request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip, user_principal)
 
-    # 7. Enforce Security Decisions
+
+    # 11. Enforce Security Decisions
     if risk_score.decision == Decision.BLOCK:
         return JSONResponse(
             status_code=403,
@@ -239,7 +365,6 @@ async def security_pipeline_middleware(request: Request, call_next):
             }
         )
 
-    # Hard throttle if rate exceeded max limit
     if count > 1000:
         return JSONResponse(
             status_code=429,
@@ -247,7 +372,7 @@ async def security_pipeline_middleware(request: Request, call_next):
             content={"error": "Too Many Requests", "request_id": request_id, "message": "Rate limit exceeded"}
         )
 
-    # 8. Forward Legitimate Traffic to Upstream ERP
+    # 12. Forward Legitimate Traffic to Upstream ERP
     upstream_url = f"{config.backend_url}{request.url.path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
@@ -269,6 +394,14 @@ async def security_pipeline_middleware(request: Request, call_next):
             content=body_bytes
         )
         
+        # Track failed logins for brute force defense
+        if request.url.path == "/api/auth/login" and upstream_resp.status_code == 401:
+            try:
+                login_body = json.loads(body_text)
+                credential_defense.record_failure(client_ip, login_body.get("username", ""))
+            except Exception:
+                credential_defense.record_failure(client_ip)
+
         response = Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -278,8 +411,38 @@ async def security_pipeline_middleware(request: Request, call_next):
         response.headers["X-Decision"] = risk_score.decision.value
         response.headers["X-Risk-Score"] = str(risk_score.overall)
         return response
-        
+
+    except RuntimeError as exc:
+        if "Event loop is closed" in str(exc):
+            http_client = None
+            client = get_http_client()
+            upstream_resp = await client.request(
+                method=request.method,
+                url=upstream_url,
+                headers=forward_headers,
+                content=body_bytes
+            )
+            response = Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers=dict(upstream_resp.headers)
+            )
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Decision"] = risk_score.decision.value
+            response.headers["X-Risk-Score"] = str(risk_score.overall)
+            return response
+        logger.error(f"RuntimeError proxying request {request_id} to {upstream_url}: {exc}")
+        return JSONResponse(
+            status_code=502,
+            headers={"X-Request-ID": request_id},
+            content={
+                "error": "Bad Gateway",
+                "request_id": request_id,
+                "message": "Security gateway was unable to communicate with backend ERP service"
+            }
+        )
     except Exception as exc:
+
         logger.error(f"Failed to proxy request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,
