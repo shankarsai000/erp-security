@@ -10,6 +10,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from gateway.anomaly_detection import anomaly_detector
 from gateway.auth_engine import auth_engine
 from gateway.config import config
 from gateway.credential_defense import credential_defense
@@ -93,7 +94,9 @@ def emit_audit_event(
     latency_ms: float,
     client_ip: str,
     principal: str = "",
-    fired_rules: Optional[List[str]] = None
+    fired_rules: Optional[List[str]] = None,
+    anomaly_score: float = 0.0,
+    anomaly_reasons: Optional[List[str]] = None
 ):
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -106,6 +109,8 @@ def emit_audit_event(
         "risk_score": risk_score.overall,
         "components": risk_score.components,
         "fired_rules": fired_rules or [],
+        "anomaly_score": round(anomaly_score, 2),
+        "anomaly_reasons": anomaly_reasons or [],
         "reasons": risk_score.reasons,
         "latency_ms": round(latency_ms, 2),
         "user_agent": request.headers.get("User-Agent", "unknown")
@@ -342,13 +347,25 @@ async def security_pipeline_middleware(request: Request, call_next):
     if fired_rules:
         reasons.extend(rules_engine.fired_reasons)
 
-    # 10. Rate Limiting Check
+    # 10. Phase 5: Deterministic Statistical Anomaly Detection
+    anomaly_request_data = {
+        "user_id": user_principal or client_ip,
+        "path": request.url.path,
+        "request_size_bytes": len(body_bytes),
+        "latency_ms": (time.time() - start_time) * 1000.0,
+        "request_hour": datetime.now(timezone.utc).hour,
+    }
+    anomaly_res = anomaly_detector.detect_anomalies(anomaly_request_data)
+    if anomaly_res.is_anomalous:
+        reasons.extend(anomaly_res.reasons)
+
+    # 11. Rate Limiting Check
     rate_key = client_ip
     count, rate_severity = rate_limiter.check_rate(rate_key)
     if rate_severity > 50:
         reasons.append(f"Elevated request rate detected: {count} req/min")
 
-    # 11. Calculate Bounded Risk Score & Decision
+    # 12. Calculate Bounded Risk Score & Decision
     risk_score = calculate_risk(
         waf_severity=waf_severity,
         auth_anomaly=auth_anomaly,
@@ -356,11 +373,16 @@ async def security_pipeline_middleware(request: Request, call_next):
         path=request.url.path,
         user_trust=user_trust,
         rule_severity=float(rule_severity),
+        anomaly_score=float(anomaly_res.score),
         extra_reasons=reasons
     )
 
     elapsed_ms = (time.time() - start_time) * 1000
-    emit_audit_event(request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip, user_principal, fired_rules=fired_rules)
+    emit_audit_event(
+        request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip,
+        user_principal, fired_rules=fired_rules, anomaly_score=anomaly_res.score,
+        anomaly_reasons=anomaly_res.reasons
+    )
 
 
 

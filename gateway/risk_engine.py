@@ -40,11 +40,12 @@ def calculate_risk(
     user_trust: float = 1.0,      # 0.0 to 1.0 (1.0 = fully trusted, 0.0 = untrusted/anonymous)
     contextual_risk: float = 0.0, # 0.0 to 1.0
     rule_severity: float = 0.0,   # 0.0 to 100.0 (Phase 4 Deterministic Business Logic Rules)
+    anomaly_score: float = 0.0,   # 0.0 to 100.0 (Phase 5 Statistical Anomaly Detection)
     extra_reasons: Optional[List[str]] = None
 ) -> RiskScore:
     """
     Computes bounded, explainable risk score (0-100) per CRITICAL_IMPROVEMENTS_SUMMARY #1.
-    Integrates WAF, Auth, Rate, Context, and Deterministic Business Logic Rule severity.
+    Integrates WAF, Auth, Rate, Context, Deterministic Rules, and Statistical Anomaly score.
     """
     reasons = list(extra_reasons or [])
     
@@ -69,8 +70,8 @@ def calculate_risk(
     # 3. User Trustworthiness (0-100)
     user_trust_score = max(0.0, min(100.0, user_trust * 100.0))
     
-    # 4. Contextual Risk (0-100)
-    context_score = max(0.0, min(100.0, contextual_risk * 100.0))
+    # 4. Contextual Risk (0-100) - includes statistical anomaly score
+    context_score = max(0.0, min(100.0, max(contextual_risk * 100.0, anomaly_score)))
     
     # 5. Weighted composite formula
     overall = (
@@ -113,6 +114,7 @@ def calculate_risk(
             "context": round(context_score, 2),
             "waf_severity": waf_severity,
             "rule_severity": rule_severity,
+            "anomaly_score": round(anomaly_score, 2),
             "auth_anomaly": auth_anomaly,
             "rate_severity": rate_severity,
         },

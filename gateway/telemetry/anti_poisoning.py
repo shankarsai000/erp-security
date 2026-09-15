@@ -3,14 +3,21 @@ import json
 import logging
 import queue
 import threading
+from enum import Enum
 from typing import Dict, Any, Tuple
 
 logger = logging.getLogger("gateway.telemetry.anti_poisoning")
+
+class EventTier(str, Enum):
+    TIER_1_PRISTINE = "tier_1_pristine_baseline"
+    TIER_2_REVIEW = "tier_2_review_quarantine"
+    TIER_3_HARD_QUARANTINE = "tier_3_hard_quarantine"
 
 class AntiPoisoningFilter:
     """
     Enforces 'Allowed != Normal'. Excludes suspicious, flagged, or elevated risk
     sessions from contaminating the machine learning baseline (Critical Improvement #3, #10).
+    Routes events across 3 tiers (Pristine Baseline, Review Quarantine, Hard Quarantine).
     Uses background worker queue for non-blocking disk persistence.
     """
     def __init__(self, output_dir: str = "events", max_queue_size: int = 10000):
@@ -23,50 +30,66 @@ class AntiPoisoningFilter:
         self._worker = threading.Thread(target=self._process_queue, daemon=True)
         self._worker.start()
 
+    def classify_event(self, event: Dict[str, Any]) -> EventTier:
+        """
+        Classifies incoming telemetry event into one of 3 tiers.
+        Only TIER_1_PRISTINE events may ever enter baseline models.
+        """
+        decision = str(event.get("decision", "ALLOW")).upper()
+        risk_score = float(event.get("risk_score", 0.0))
+        rule_count = len(event.get("fired_rules", []))
+        user_age_days = event.get("user_account_age_days", 30)
+        incident_count = event.get("user_incident_count", 0)
+        components = event.get("components", {})
+        
+        waf_severity = float(components.get("waf_severity", 0.0) or 0.0)
+        auth_anomaly = float(components.get("auth_anomaly", 0.0) or 0.0)
+
+        # Hard VETO: Blocking decisions, explicit attacks, or critical risk go directly to Tier 3 Hard Quarantine
+        if decision == "BLOCK" or waf_severity > 0 or auth_anomaly > 0 or risk_score > 50.0:
+            return EventTier.TIER_3_HARD_QUARANTINE
+
+        # VETO: Accounts under 7 days or accounts with prior incident history go to Tier 2 Review
+        if user_age_days < 7 or incident_count > 0:
+            return EventTier.TIER_2_REVIEW
+
+        # Tier 2 Review: Throttled / LIMIT decision, moderate risk, or rule firings
+        if decision == "LIMIT" or 20.0 < risk_score <= 50.0 or rule_count > 0:
+            return EventTier.TIER_2_REVIEW
+
+        # Tier 1 Pristine Baseline: Low risk (<= 20), ALLOW, 0 rule firings, clean trusted session
+        if decision == "ALLOW" and risk_score <= 20.0 and rule_count == 0:
+            return EventTier.TIER_1_PRISTINE
+
+        return EventTier.TIER_3_HARD_QUARANTINE
+
     def process_event(self, event: Dict[str, Any]) -> Tuple[str, bool]:
         """
         Classifies and routes event into 'baseline' or 'quarantine' in memory,
         and enqueues disk write asynchronously.
         Returns: (tier_classification, is_quarantined)
         """
-        risk_score = float(event.get("risk_score", 0.0))
-        reasons = event.get("reasons", [])
-        decision = event.get("decision", "ALLOW")
-        components = event.get("components", {})
-        
-        try:
-            waf_severity = float(components.get("waf_severity", 0.0) or 0.0)
-        except (ValueError, TypeError):
-            waf_severity = 0.0
+        tier = self.classify_event(event)
 
-        try:
-            auth_anomaly = float(components.get("auth_anomaly", 0.0) or 0.0)
-        except (ValueError, TypeError):
-            auth_anomaly = 0.0
+        if tier == EventTier.TIER_1_PRISTINE:
+            event["quarantined"] = False
+            event["tier"] = tier.value
+            self._enqueue(self.baseline_file, event)
+            return "TIER_1_BASELINE", False
 
-        try:
-            rate_severity = float(components.get("rate_severity", 0.0) or 0.0)
-        except (ValueError, TypeError):
-            rate_severity = 0.0
-        
-        # Tier 3: Hard Quarantine (Attacks, high risk, or any blocking policy)
-        if decision == "BLOCK" or risk_score > 50.0 or waf_severity > 0 or auth_anomaly > 0:
+        if tier == EventTier.TIER_2_REVIEW:
             event["quarantined"] = True
-            event["quarantine_reasons"] = reasons or ["Elevated risk or security anomaly detected"]
-            self._enqueue(self.quarantine_file, event)
-            return "TIER_3_QUARANTINE", True
-            
-        # Tier 2: Medium Risk / Throttled (Needs review before baseline inclusion)
-        if 20.0 < risk_score <= 50.0 or decision == "LIMIT":
-            event["quarantined"] = True
-            event["quarantine_reasons"] = ["Moderate risk score - awaiting analyst review"]
+            event["tier"] = tier.value
+            event["quarantine_reasons"] = ["Moderate risk score or review quarantine - awaiting analyst review"]
             self._enqueue(self.quarantine_file, event)
             return "TIER_2_REVIEW", True
-            
-        # Tier 1: Pristine Baseline Candidate (Allowed, risk <= 20, 0 rule firings)
-        event["quarantined"] = False
-        self._enqueue(self.baseline_file, event)
-        return "TIER_1_BASELINE", False
+
+        # Tier 3 Hard Quarantine
+        event["quarantined"] = True
+        event["tier"] = tier.value
+        event["quarantine_reasons"] = event.get("reasons") or ["Elevated risk, security attack or blocking decision"]
+        self._enqueue(self.quarantine_file, event)
+        return "TIER_3_QUARANTINE", True
 
     def _enqueue(self, file_path: str, data: Dict[str, Any]):
         try:
@@ -102,4 +125,5 @@ class AntiPoisoningFilter:
                 break
 
 anti_poisoning_filter = AntiPoisoningFilter()
+AntiPoisoningTriage = AntiPoisoningFilter
 
