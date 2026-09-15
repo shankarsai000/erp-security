@@ -4,7 +4,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -17,8 +17,10 @@ from gateway.rate_limiter import RateLimiter
 from gateway.replay_guard import replay_guard
 from gateway.risk_engine import Decision, RiskScore, calculate_risk
 from gateway.route_allowlist import route_allowlist
+from gateway.rules_engine import rules_engine
 from gateway.schemas import LoginSchema, OrderCreateSchema
 from gateway.telemetry.anti_poisoning import anti_poisoning_filter
+
 from gateway.telemetry.event_pipeline import telemetry_pipeline
 from gateway.telemetry.redaction import pseudonymize_identifier, sanitize_telemetry
 from gateway.waf import inspect_content
@@ -90,7 +92,8 @@ def emit_audit_event(
     request: Request,
     latency_ms: float,
     client_ip: str,
-    principal: str = ""
+    principal: str = "",
+    fired_rules: Optional[List[str]] = None
 ):
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -102,12 +105,14 @@ def emit_audit_event(
         "decision": decision.value,
         "risk_score": risk_score.overall,
         "components": risk_score.components,
+        "fired_rules": fired_rules or [],
         "reasons": risk_score.reasons,
         "latency_ms": round(latency_ms, 2),
         "user_agent": request.headers.get("User-Agent", "unknown")
     }
     # Scrub any accidental PII before serialization
     sanitized_event = sanitize_telemetry(event)
+
     
     # 1. Local structured logger
     audit_logger.info(json.dumps(sanitized_event))
@@ -310,24 +315,53 @@ async def security_pipeline_middleware(request: Request, call_next):
                 reasons.append(bola_reason)
                 waf_severity = max(waf_severity, 95.0)  # Hard block IDOR tampering
 
-    # 9. Rate Limiting Check
+    # 9. Phase 4: Deterministic Business Logic Rules Engine
+    payload_dict = {}
+    if body_text:
+        try:
+            payload_dict = json.loads(body_text) if isinstance(body_text, str) and body_text.strip().startswith(("{", "[")) else {}
+        except Exception:
+            payload_dict = {}
+
+    current_role = ""
+    if not is_auth_exempt and 'claims' in locals() and claims:
+        current_role = str(claims.get("role", ""))
+
+    rule_request_data = {
+        "method": request.method,
+        "path": request.url.path,
+        "body": payload_dict,
+        "client_ip": client_ip,
+        "user_id": user_principal or client_ip,
+        "current_role": current_role,
+        "is_authenticated": (not is_auth_exempt and bool(user_principal)),
+        "headers": dict(request.headers),
+    }
+
+    rule_severity, fired_rules = rules_engine.evaluate(rule_request_data)
+    if fired_rules:
+        reasons.extend(rules_engine.fired_reasons)
+
+    # 10. Rate Limiting Check
     rate_key = client_ip
     count, rate_severity = rate_limiter.check_rate(rate_key)
     if rate_severity > 50:
         reasons.append(f"Elevated request rate detected: {count} req/min")
 
-    # 10. Calculate Bounded Risk Score & Decision
+    # 11. Calculate Bounded Risk Score & Decision
     risk_score = calculate_risk(
         waf_severity=waf_severity,
         auth_anomaly=auth_anomaly,
         rate_severity=float(rate_severity),
         path=request.url.path,
         user_trust=user_trust,
+        rule_severity=float(rule_severity),
         extra_reasons=reasons
     )
 
     elapsed_ms = (time.time() - start_time) * 1000
-    emit_audit_event(request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip, user_principal)
+    emit_audit_event(request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip, user_principal, fired_rules=fired_rules)
+
 
 
     # 11. Enforce Security Decisions

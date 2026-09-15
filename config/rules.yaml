@@ -1,0 +1,63 @@
+# Deterministic Business Logic Rules Configuration
+# Hot-reloadable: Changes take effect without restarting the gateway service.
+
+rules:
+  - rule_id: "R001"
+    category: "business_logic"
+    description: "Order item has negative price"
+    severity: 100
+    check_type: "negative_price"
+    remediation: "block"
+
+  - rule_id: "R002"
+    category: "api_abuse"
+    description: "Same order placed twice in <5 seconds"
+    severity: 60
+    check_type: "duplicate_order"
+    state_ttl: 5.0
+    threshold: 2
+    remediation: "challenge"
+
+  - rule_id: "R003"
+    category: "resource_depletion"
+    description: "Order quantity would deplete inventory below 0"
+    severity: 80
+    check_type: "inventory_depletion"
+    remediation: "block"
+
+  - rule_id: "R004"
+    category: "privilege_escalation"
+    description: "User attempting to grant themselves admin role"
+    severity: 100
+    check_type: "role_escalation"
+    remediation: "block"
+
+  - rule_id: "R005"
+    category: "sequence_violation"
+    description: "POST /api/orders without prior authentication or valid session"
+    severity: 75
+    check_type: "sequence_violation"
+    remediation: "challenge"
+
+  - rule_id: "R006"
+    category: "api_abuse"
+    description: "User accessing excessive orders in 1 minute (mass scraping)"
+    severity: 65
+    check_type: "mass_access"
+    window_seconds: 60.0
+    threshold: 100
+    remediation: "limit"
+
+enforcement_policy:
+  - min_severity: 0
+    max_severity: 30
+    decision: "allow"
+  - min_severity: 31
+    max_severity: 60
+    decision: "limit"
+  - min_severity: 61
+    max_severity: 79
+    decision: "challenge"
+  - min_severity: 80
+    max_severity: 100
+    decision: "block"

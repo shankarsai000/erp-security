@@ -170,13 +170,16 @@ class TestReplayProtection:
         payload = {"customer_id": "cust-1", "items": ["Widget A"], "total_amount": 99.0}
 
         # First request with this nonce passes replay check
+        client_ip = f"10.150.1.{uuid.uuid4().hex[:4]}"
+        headers = {
+            "Authorization": f"Bearer {SALES_TOKEN}",
+            "X-Forwarded-For": client_ip,
+            "X-Timestamp": ts,
+            "X-Nonce": nonce
+        }
         resp1 = client.post(
             "/api/orders",
-            headers={
-                "Authorization": f"Bearer {SALES_TOKEN}",
-                "X-Timestamp": ts,
-                "X-Nonce": nonce
-            },
+            headers=headers,
             json=payload
         )
         assert resp1.status_code == 200
@@ -184,16 +187,13 @@ class TestReplayProtection:
         # Duplicate request with the identical nonce must be rejected
         resp2 = client.post(
             "/api/orders",
-            headers={
-                "Authorization": f"Bearer {SALES_TOKEN}",
-                "X-Timestamp": ts,
-                "X-Nonce": nonce
-            },
+            headers=headers,
             json=payload
         )
         assert resp2.status_code == 403
         data = resp2.json()
         assert any("replay" in r.lower() for r in data["reasons"])
+
 
 class TestBOLAandIDORDefense:
     def test_user_cannot_access_other_user_profile(self):

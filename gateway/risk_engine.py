@@ -39,22 +39,26 @@ def calculate_risk(
     path: str,
     user_trust: float = 1.0,      # 0.0 to 1.0 (1.0 = fully trusted, 0.0 = untrusted/anonymous)
     contextual_risk: float = 0.0, # 0.0 to 1.0
+    rule_severity: float = 0.0,   # 0.0 to 100.0 (Phase 4 Deterministic Business Logic Rules)
     extra_reasons: Optional[List[str]] = None
 ) -> RiskScore:
     """
     Computes bounded, explainable risk score (0-100) per CRITICAL_IMPROVEMENTS_SUMMARY #1.
+    Integrates WAF, Auth, Rate, Context, and Deterministic Business Logic Rule severity.
     """
     reasons = list(extra_reasons or [])
     
     # 1. Threat dimensions composite (0-100)
-    # If WAF has a critical trigger (>80), elevate threat score immediately
-    raw_threat_avg = (waf_severity + auth_anomaly + rate_severity) / 3.0
+    # If WAF or Rules Engine has a critical trigger (>=80), elevate threat score immediately
+    raw_threat_avg = (waf_severity + auth_anomaly + rate_severity + rule_severity) / 4.0
     if waf_severity >= 90:
         threat_score = max(waf_severity, raw_threat_avg)
+    elif rule_severity >= 80:
+        threat_score = max(rule_severity, raw_threat_avg)
     elif auth_anomaly >= 90:
         threat_score = max(auth_anomaly, raw_threat_avg)
     else:
-        threat_score = min(100.0, raw_threat_avg)
+        threat_score = min(100.0, max(raw_threat_avg, rule_severity * 0.5))
         
     threat_score = max(0.0, min(100.0, threat_score))
     
@@ -76,11 +80,13 @@ def calculate_risk(
         context_score * 0.15
     )
     
-    # If critical attack pattern or hard auth failure, guarantee hard boundary
-    if waf_severity >= 80:
-        overall = max(overall, 85.0)  # Guarantees BLOCK
+    # Hard boundary guarantees
+    if waf_severity >= 80 or rule_severity >= 80:
+        overall = max(overall, 85.0)  # Guarantees BLOCK (HTTP 403)
+    elif rule_severity >= 60:
+        overall = max(overall, 65.0)  # Guarantees CHALLENGE (HTTP 401) or LIMIT
     elif auth_anomaly >= 80 and path.startswith("/api/") and path != "/api/auth/login":
-        if waf_severity < 75.0:
+        if waf_severity < 75.0 and rule_severity < 75.0:
             overall = min(74.0, max(overall, 60.0))  # Guarantees CHALLENGE (HTTP 401)
         else:
             overall = max(overall, 85.0)  # Combined with attack -> BLOCK (HTTP 403)
@@ -106,9 +112,11 @@ def calculate_risk(
             "user_trust": round(user_trust_score, 2),
             "context": round(context_score, 2),
             "waf_severity": waf_severity,
+            "rule_severity": rule_severity,
             "auth_anomaly": auth_anomaly,
             "rate_severity": rate_severity,
         },
         reasons=reasons,
         decision=decision
     )
+
