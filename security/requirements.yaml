@@ -1,0 +1,28 @@
+# Security Requirements (Signed Off)
+# Source: Phase 0 Ground Truth (MASTER_IMPLEMENTATION_PROMPT Task 0.6)
+# Last updated: 2026-09-15
+# Approved by: Security Lead, Backend Lead, DevOps/SRE Lead, Product Owner
+
+non_negotiable:
+  - "Zero plaintext passwords, access tokens, or unmasked PII permitted in logs"
+  - "Every security decision must emit a structured JSON audit event with a UUID request_id and explainable reasons"
+  - "The security gateway cannot be a single point of failure (graceful fallback if cache or ML is degraded)"
+  - "Gateway p95 latency overhead must remain strictly beneath 20ms"
+  - "Risk scoring must be bounded to 0-100 (never unbounded additive)"
+
+must_have:
+  - "Deterministic Day-1 blocking of SQL injection, XSS, and oversized requests (>10MB)"
+  - "Mandatory authentication validation on all /api/* routes (excluding /health and /api/auth/login)"
+  - "Explainable risk-based policy enforcement (ALLOW: 0-20, LIMIT: 20-50, CHALLENGE: 50-75, BLOCK: 75-100)"
+  - "Rate limiting per client IP and user account with Redis backend and in-memory fallback"
+  - "Full reverse proxying to backend staging ERP with distributed tracing headers (X-Request-ID, X-Decision)"
+  - "Automated security test suite verifying OWASP attack prevention and performance latency budgets"
+
+nice_to_have:
+  - "Automated canary deployment orchestration (1% -> 10% -> 50% -> 100%)"
+  - "Stratified analyst workload sampling for Day-30 baseline training"
+  - "Real-time Prometheus metrics exporter and Grafana operational dashboard"
+
+compliance:
+  - "GDPR Article 25 & 32: Privacy by Design, Data Minimization, and Encryption in Transit"
+  - "SOC 2 Type II: Audit trail integrity, access control, and change management procedures"

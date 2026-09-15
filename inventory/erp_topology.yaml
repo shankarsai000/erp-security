@@ -1,0 +1,50 @@
+# ERP Topology Inventory
+# Source: Phase 0 Ground Truth (MASTER_IMPLEMENTATION_PROMPT Task 0.1)
+# Last updated: 2026-09-15
+# Owner: Infrastructure Engineer & Security Architecture Team
+
+frontend:
+  web_framework: "PHP 8.1"
+  framework: "Laravel 9"
+  application_server: "nginx 1.24 (FastCGI / PHP-FPM)"
+  architecture: "Monolithic ERP with REST API endpoints"
+
+android_app:
+  language: "Kotlin 1.9"
+  min_api_level: 24
+  target_api_level: 34
+  current_version: "2.4.0"
+  app_signing: "Android App Bundle with Google Play Release Key & APK Signature Scheme v3"
+  network_security_config: "TLS 1.3 enforced, Certificate Pinning configured"
+
+backend:
+  database_engine: "PostgreSQL 14.10"
+  host: "prod-db.internal"
+  port: 5432
+  connection_pooling: "PgBouncer (Transaction mode)"
+  backup_strategy: "Continuous WAL archiving to S3 + hourly automated snapshots"
+  replication: "Primary with 2 synchronous read-replicas across multi-AZ"
+  audit_extension: "pgaudit (logging DDL, writes, connections, role changes)"
+
+networking:
+  existing_firewall: "AWS Security Group (Strict egress & ingress)"
+  load_balancer: "AWS Application Load Balancer (ALB)"
+  waf: "ERP Security Gateway (FastAPI + Nginx)"
+  cdn: "AWS CloudFront"
+  dns_provider: "AWS Route 53 (DNSSEC enabled)"
+  certificate_management: "AWS ACM / Let's Encrypt automated TLS renewal"
+  tls_versions:
+    - "TLSv1.2"
+    - "TLSv1.3"
+
+deployment:
+  environment: "Hybrid Cloud (AWS us-east-1)"
+  container_orchestration: "Docker Compose (Dev/Staging) / ECS Fargate (Production)"
+  cicd_pipeline: "GitHub Actions (Lint, Static Analysis, Unit/Integration Tests, Security Scans)"
+  deployment_frequency: "Bi-weekly planned releases with canary progression"
+
+monitoring:
+  application_monitoring: "Prometheus + Grafana"
+  logging: "Structured JSON logs forwarded to OpenSearch / CloudWatch"
+  metrics: "Prometheus exporter for gateway latency, error rates, threat counters"
+  alerting: "PagerDuty oncall integration for P1/P0 security incidents"

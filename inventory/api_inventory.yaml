@@ -1,0 +1,85 @@
+# API Inventory
+# Source: Phase 0 Ground Truth (MASTER_IMPLEMENTATION_PROMPT Task 0.2)
+# Last updated: 2026-09-15
+# Owner: Backend Engineering & Security Architecture Team
+
+endpoints:
+  - path: "/api/orders"
+    methods: ["GET", "POST"]
+    auth: "JWT Bearer Token"
+    roles: ["sales", "manager", "admin"]
+    avg_payload_bytes: 1250
+    max_payload_bytes: 50000
+    call_rate_per_min: 120
+    p50_latency_ms: 35
+    p95_latency_ms: 90
+    criticality: "HIGH"
+    data_sensitivity: "PII + Financial"
+    description: "List recent orders or create a new sales order"
+
+  - path: "/api/orders/{id}"
+    methods: ["GET", "PUT", "DELETE"]
+    auth: "JWT Bearer Token"
+    roles: ["sales", "manager", "admin"]
+    roles_check: "Tenant/Rep ownership enforcement; DELETE restricted to admin"
+    avg_payload_bytes: 850
+    max_payload_bytes: 20000
+    call_rate_per_min: 80
+    p50_latency_ms: 25
+    p95_latency_ms: 70
+    criticality: "HIGH"
+    data_sensitivity: "PII + Financial"
+    description: "Fetch, update, or cancel order by identifier"
+
+  - path: "/api/users/{id}"
+    methods: ["GET", "PUT"]
+    auth: "JWT Bearer Token"
+    roles: ["user", "manager", "admin"]
+    roles_check: "User can only read/update their own profile unless admin"
+    avg_payload_bytes: 650
+    max_payload_bytes: 10000
+    call_rate_per_min: 40
+    p50_latency_ms: 20
+    p95_latency_ms: 50
+    criticality: "HIGH"
+    data_sensitivity: "PII"
+    description: "User account management and profile queries"
+
+  - path: "/api/inventory"
+    methods: ["GET"]
+    auth: "JWT Bearer Token"
+    roles: ["warehouse", "sales", "manager", "admin"]
+    avg_payload_bytes: 4500
+    max_payload_bytes: 250000
+    call_rate_per_min: 150
+    p50_latency_ms: 45
+    p95_latency_ms: 110
+    criticality: "MEDIUM"
+    data_sensitivity: "Internal Business Operations"
+    description: "Query real-time warehouse inventory SKU counts and stock locations"
+
+  - path: "/api/auth/login"
+    methods: ["POST"]
+    auth: "None (Public Credentials Exchange)"
+    roles: ["anonymous"]
+    avg_payload_bytes: 220
+    max_payload_bytes: 1024
+    call_rate_per_min: 30
+    p50_latency_ms: 60
+    p95_latency_ms: 150
+    criticality: "CRITICAL"
+    data_sensitivity: "Authentication Credentials"
+    description: "Authenticates user credentials and issues signed JWT bearer tokens with refresh cookie"
+
+  - path: "/health"
+    methods: ["GET"]
+    auth: "None"
+    roles: ["anonymous"]
+    avg_payload_bytes: 0
+    max_payload_bytes: 0
+    call_rate_per_min: 60
+    p50_latency_ms: 1
+    p95_latency_ms: 3
+    criticality: "LOW"
+    data_sensitivity: "Public Health Status"
+    description: "Service liveness and readiness probe"

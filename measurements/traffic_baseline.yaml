@@ -1,0 +1,43 @@
+# Production Traffic Baseline & Metrics
+# Source: Phase 0 Ground Truth (MASTER_IMPLEMENTATION_PROMPT Task 0.3)
+# Captured: 2026-09-15
+# Owner: DevOps / SRE & Security Engineering
+
+traffic_baseline:
+  peak_rps: 45
+  average_rps: 15
+  off_peak_rps: 2
+  peak_concurrent_connections: 500
+  typical_concurrent_connections: 120
+
+response_times:
+  p50_ms: 35
+  p95_ms: 85
+  p99_ms: 220
+  max_acceptable_gateway_overhead_p95_ms: 20
+
+request_sizes:
+  min_bytes: 48
+  avg_bytes: 1250
+  median_bytes: 820
+  p95_bytes: 4200
+  max_allowed_bytes: 10485760  # 10 MB limit enforced at gateway
+
+response_sizes:
+  min_bytes: 120
+  avg_bytes: 3800
+  median_bytes: 2100
+  p95_bytes: 18000
+  max_bytes: 1500000
+
+error_rates:
+  status_2xx_percent: 96.8
+  status_3xx_percent: 0.7
+  status_4xx_percent: 2.1  # Client errors (auth failures, bad params)
+  status_5xx_percent: 0.4  # Server exceptions (target < 0.5%)
+
+temporal_distribution:
+  business_hours: "08:00 - 19:00 EST"
+  peak_window: "10:00 - 15:00 EST"
+  weekday_vs_weekend_ratio: "5.2 : 1"
+  seasonal_notes: "Fiscal Q4 experiences 2.8x surge; August experiences 0.6x dip"
