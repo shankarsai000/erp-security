@@ -36,7 +36,9 @@ from gateway.security_metrics import security_metrics_tracker
 from ml.retraining_pipeline import ModelRetrainingPipeline
 from gateway.ha_dr import ha_manager, circuit_breaker
 from gateway.compliance import tamper_evident_audit_chain, compliance_reporter
+from gateway.canary_router import CanaryRouter, CanaryStage
 
+canary_router = CanaryRouter()
 mitigation_engine = MitigationEngine()
 security_orchestrator.mitigation_engine = mitigation_engine
 
@@ -384,6 +386,45 @@ async def get_ha_circuit_breaker_status():
     }
 
 
+# Phase 11: Canary Deployment Endpoints
+@app.get("/api/canary/status")
+async def get_canary_status():
+    """Diagnostic status, routing weight, and SLO metrics of the canary router."""
+    return canary_router.get_status()
+
+
+@app.post("/api/canary/promote")
+async def promote_canary(request: Request):
+    """Promotes canary rollout stage or weight."""
+    data = await request.json()
+    if "stage" in data:
+        stage_str = data["stage"].strip()
+        found_stage = None
+        for s in CanaryStage:
+            if s.value == stage_str or s.name == stage_str:
+                found_stage = s
+                break
+        if not found_stage:
+            return JSONResponse(status_code=400, content={"error": f"Invalid stage: {stage_str}"})
+        return canary_router.promote(found_stage)
+    elif "weight" in data:
+        canary_router.set_weight(float(data["weight"]))
+        return canary_router.get_status()
+    else:
+        return JSONResponse(status_code=400, content={"error": "Must provide 'stage' or 'weight'"})
+
+
+@app.post("/api/canary/rollback")
+async def rollback_canary(request: Request):
+    """Triggers instant canary rollback to 0%."""
+    try:
+        data = await request.json()
+        reason = data.get("reason", "Manual operator rollback")
+    except Exception:
+        reason = "Manual operator rollback"
+    return canary_router.rollback(reason=reason)
+
+
 @app.middleware("http")
 async def security_pipeline_middleware(request: Request, call_next):
     start_time = time.time()
@@ -398,13 +439,15 @@ async def security_pipeline_middleware(request: Request, call_next):
             "/health", "/health/live", "/health/ready",
             "/api/ml/health", "/api/ml/rollback", "/api/ml/recover",
             "/api/mitigations/status", "/api/ml/retrain", "/api/metrics/security",
-            "/api/ha/status", "/api/compliance/report", "/api/compliance/verify-chain"
+            "/api/ha/status", "/api/compliance/report", "/api/compliance/verify-chain",
+            "/api/canary/status", "/api/canary/promote", "/api/canary/rollback"
         )
         or request.url.path.startswith("/api/agents")
         or request.url.path.startswith("/api/soc")
         or request.url.path.startswith("/api/metrics")
         or request.url.path.startswith("/api/compliance")
         or request.url.path.startswith("/api/ha")
+        or request.url.path.startswith("/api/canary")
     ):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -790,6 +833,15 @@ async def security_pipeline_middleware(request: Request, call_next):
     for h in ["host", "content-length", "transfer-encoding"]:
         forward_headers.pop(h, None)
 
+    # Phase 11: Canary Traffic Decision
+    is_canary = canary_router.should_route_to_canary(
+        user_id=user_principal,
+        client_ip=client_ip,
+        headers=forward_headers
+    )
+    forward_headers["X-Gateway-Route"] = "canary" if is_canary else "stable"
+    proxy_start_time = time.time()
+
     try:
         client = get_http_client()
         upstream_resp = await client.request(
@@ -798,7 +850,9 @@ async def security_pipeline_middleware(request: Request, call_next):
             headers=forward_headers,
             content=body_bytes
         )
+        proxy_latency_ms = (time.time() - proxy_start_time) * 1000
         circuit_breaker.record_success()
+        canary_router.record_metric(is_canary, proxy_latency_ms, upstream_resp.status_code)
         
         # Track failed logins for brute force defense
         if request.url.path == "/api/auth/login" and upstream_resp.status_code == 401:
@@ -816,9 +870,11 @@ async def security_pipeline_middleware(request: Request, call_next):
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Decision"] = risk_score.decision.value
         response.headers["X-Risk-Score"] = str(risk_score.overall)
+        response.headers["X-Gateway-Route"] = "canary" if is_canary else "stable"
         return response
 
     except RuntimeError as exc:
+        proxy_latency_ms = (time.time() - proxy_start_time) * 1000
         if "Event loop is closed" in str(exc):
             http_client = None
             client = get_http_client()
@@ -829,6 +885,7 @@ async def security_pipeline_middleware(request: Request, call_next):
                 content=body_bytes
             )
             circuit_breaker.record_success()
+            canary_router.record_metric(is_canary, proxy_latency_ms, upstream_resp.status_code)
             response = Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
@@ -837,12 +894,14 @@ async def security_pipeline_middleware(request: Request, call_next):
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Decision"] = risk_score.decision.value
             response.headers["X-Risk-Score"] = str(risk_score.overall)
+            response.headers["X-Gateway-Route"] = "canary" if is_canary else "stable"
             return response
         circuit_breaker.record_failure(str(exc))
+        canary_router.record_metric(is_canary, proxy_latency_ms, 502)
         logger.error(f"RuntimeError proxying request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,
-            headers={"X-Request-ID": request_id},
+            headers={"X-Request-ID": request_id, "X-Gateway-Route": "canary" if is_canary else "stable"},
             content={
                 "error": "Bad Gateway",
                 "request_id": request_id,
@@ -850,11 +909,13 @@ async def security_pipeline_middleware(request: Request, call_next):
             }
         )
     except Exception as exc:
+        proxy_latency_ms = (time.time() - proxy_start_time) * 1000
         circuit_breaker.record_failure(str(exc))
+        canary_router.record_metric(is_canary, proxy_latency_ms, 502)
         logger.error(f"Failed to proxy request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,
-            headers={"X-Request-ID": request_id},
+            headers={"X-Request-ID": request_id, "X-Gateway-Route": "canary" if is_canary else "stable"},
             content={
                 "error": "Bad Gateway",
                 "request_id": request_id,

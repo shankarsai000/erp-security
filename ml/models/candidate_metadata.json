@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-09-17T15:34:12.499491+00:00",
+  "trained_at": "2026-09-17T15:47:28.899688+00:00",
   "sample_count": 200,
   "feature_count": 16,
   "feature_names": [
@@ -26,5 +26,5 @@
   "validation_fpr": 0.01,
   "validation_fnr": 0.0,
   "promotion_granted": true,
-  "promoted_at": "2026-09-17T15:34:12.627136+00:00"
+  "promoted_at": "2026-09-17T15:47:28.918135+00:00"
 }
