@@ -29,6 +29,7 @@ from gateway.waf import inspect_content
 from ml.model_service import MLModelService
 from ml.feature_engineering import FeatureExtractor
 from collections import deque
+from agents.orchestrator import security_orchestrator
 
 # Logging configuration
 logging.basicConfig(
@@ -148,6 +149,15 @@ def emit_audit_event(
     # 3. Anti-Poisoning Quarantine Routing (Phase 3)
     anti_poisoning_filter.process_event(sanitized_event)
 
+    # 4. Phase 7: Security Agents Evaluation for suspicious or elevated-risk events
+    if risk_score.overall >= 30.0 or len(fired_rules or []) > 0 or ml_anomalous:
+        try:
+            user_key = principal or client_ip
+            recent_hist = list(user_recent_events.get(user_key, []))
+            security_orchestrator.process_security_event(sanitized_event, recent_hist)
+        except Exception as exc:
+            logger.error(f"Error in SecurityOrchestrator: {exc}")
+
 @app.get("/health")
 async def health_check():
     """Unprotected health liveness check."""
@@ -175,6 +185,58 @@ async def ml_service_recover():
     ml_service.recover()
     return {"status": "recovered", "health": ml_service.get_health()}
 
+# Phase 7: Security Agents Analyst Endpoints
+@app.get("/api/agents/status")
+async def agents_status():
+    """Status summary of all Phase 7 security agents and active containment."""
+    return security_orchestrator.get_status()
+
+@app.get("/api/agents/alerts")
+async def agents_alerts(limit: int = 50):
+    """Retrieve security alerts detected by DetectionAgent."""
+    return security_orchestrator.get_alerts(limit=limit)
+
+@app.get("/api/agents/incidents/{incident_id}")
+async def agents_incident_dossier(incident_id: str):
+    """Retrieve full incident timeline and blast radius report."""
+    incident = security_orchestrator.get_incident(incident_id)
+    if not incident:
+        return JSONResponse(status_code=404, content={"error": "Incident not found"})
+    return incident
+
+@app.get("/api/agents/actions/pending")
+async def agents_pending_actions():
+    """Retrieve containment actions awaiting human analyst approval."""
+    return security_orchestrator.get_pending_actions()
+
+@app.post("/api/agents/actions/{action_id}/approve")
+async def agents_approve_action(action_id: str, analyst_id: str = "security_analyst"):
+    """Human approval gate: authorize high-impact containment action."""
+    try:
+        return security_orchestrator.approve_action(action_id, analyst_id)
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "Action not found"})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+@app.post("/api/agents/actions/{action_id}/reject")
+async def agents_reject_action(action_id: str, analyst_id: str = "security_analyst", reason: str = ""):
+    """Human approval gate: reject high-impact containment action."""
+    try:
+        return security_orchestrator.reject_action(action_id, analyst_id, reason)
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "Action not found"})
+
+@app.post("/api/agents/actions/{action_id}/revoke")
+async def agents_revoke_action(action_id: str, analyst_id: str = "security_analyst"):
+    """Instant containment rollback (<30s SLA): revert executed action."""
+    try:
+        return security_orchestrator.revoke_action(action_id, analyst_id)
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "Action not found"})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
 
 @app.middleware("http")
 async def security_pipeline_middleware(request: Request, call_next):
@@ -185,7 +247,10 @@ async def security_pipeline_middleware(request: Request, call_next):
     request.state.request_id = request_id
     
     # Health and management endpoints bypass proxying and security pipeline
-    if request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover"):
+    if (
+        request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover")
+        or request.url.path.startswith("/api/agents")
+    ):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response
