@@ -29,11 +29,13 @@ class SecurityOrchestrator:
     def __init__(
         self,
         audit_file: str = "events/agent_audit.jsonl",
-        enabled: bool = True
+        enabled: bool = True,
+        mitigation_engine: Optional[Any] = None
     ):
         self.enabled = enabled
         self.audit_file = Path(audit_file)
         self.audit_file.parent.mkdir(parents=True, exist_ok=True)
+        self.mitigation_engine = mitigation_engine
 
         # Initialize the 4 specialized agents
         self.detection_agent = DetectionAgent()
@@ -89,6 +91,14 @@ class SecurityOrchestrator:
         # 4. Response Phase
         plan = self.response_agent.formulate_response_plan(alert=alert, report=report)
         self.plans[report.incident_id] = plan
+
+        # Phase 8: Apply automatically executed safe mitigations directly to mitigation engine
+        if self.mitigation_engine and plan.auto_executed_actions:
+            for action in plan.auto_executed_actions:
+                try:
+                    self.mitigation_engine.apply_action(action)
+                except Exception as exc:
+                    logger.error(f"Failed to apply auto mitigation {action.action_id}: {exc}")
 
         # 5. Persist Agent Audit Trail
         self._flush_audit_records()
@@ -163,6 +173,12 @@ class SecurityOrchestrator:
     def approve_action(self, action_id: str, analyst_id: str) -> Dict[str, Any]:
         """Analyst authorizes high-impact containment action."""
         action = self.response_agent.approve_action(action_id, analyst_id)
+        # Phase 8: Once approved by human analyst, immediately enforce in mitigation engine
+        if self.mitigation_engine and action.approval_status in (ApprovalStatus.APPROVED, ApprovalStatus.EXECUTED):
+            try:
+                self.mitigation_engine.apply_action(action)
+            except Exception as exc:
+                logger.error(f"Failed to enforce approved mitigation {action_id}: {exc}")
         self._flush_audit_records()
         return action.to_dict()
 
@@ -175,6 +191,9 @@ class SecurityOrchestrator:
     def revoke_action(self, action_id: str, analyst_id: Optional[str] = None) -> Dict[str, Any]:
         """Revert / rollback previously executed containment action (<30s SLA)."""
         action = self.response_agent.revoke_action(action_id, analyst_id)
+        # Phase 8: Instantly rollback from active mitigation engine
+        if self.mitigation_engine:
+            self.mitigation_engine.rollback_action(action_id)
         self._flush_audit_records()
         return action.to_dict()
 

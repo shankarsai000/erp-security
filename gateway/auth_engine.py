@@ -74,4 +74,16 @@ class AuthEngine:
                 
         return True, "Authorized"
 
+    def generate_token(self, principal_id: str, roles: Optional[List[str]] = None, expires_in_seconds: int = 3600) -> str:
+        """Mint a cryptographic test token for authentication validation."""
+        header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "sub": principal_id,
+            "roles": roles or ["user"],
+            "role": (roles[0] if roles else "user"),
+            "exp": time.time() + expires_in_seconds
+        }).encode()).decode().rstrip("=")
+        sig = base64.urlsafe_b64encode(b"simulated_signature").decode().rstrip("=")
+        return f"{header}.{payload}.{sig}"
+
 auth_engine = AuthEngine()

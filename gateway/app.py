@@ -30,6 +30,10 @@ from ml.model_service import MLModelService
 from ml.feature_engineering import FeatureExtractor
 from collections import deque
 from agents.orchestrator import security_orchestrator
+from gateway.mitigation_engine import MitigationEngine, MitigationDecision, UnauthorizedMitigationError
+
+mitigation_engine = MitigationEngine()
+security_orchestrator.mitigation_engine = mitigation_engine
 
 # Logging configuration
 logging.basicConfig(
@@ -238,6 +242,12 @@ async def agents_revoke_action(action_id: str, analyst_id: str = "security_analy
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 
+@app.get("/api/mitigations/status")
+async def mitigations_status():
+    """Active mitigation engine status and registry counts (Phase 8)."""
+    return mitigation_engine.get_status()
+
+
 @app.middleware("http")
 async def security_pipeline_middleware(request: Request, call_next):
     start_time = time.time()
@@ -248,7 +258,7 @@ async def security_pipeline_middleware(request: Request, call_next):
     
     # Health and management endpoints bypass proxying and security pipeline
     if (
-        request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover")
+        request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover", "/api/mitigations/status")
         or request.url.path.startswith("/api/agents")
     ):
         response = await call_next(request)
@@ -257,6 +267,26 @@ async def security_pipeline_middleware(request: Request, call_next):
 
     client_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "127.0.0.1")
     reasons = []
+
+    # Phase 8: Active IP & Token Mitigation Check (Fast O(1) Pre-Routing Drop)
+    auth_header = request.headers.get("Authorization", "")
+    mitigation = mitigation_engine.evaluate_request(
+        client_ip=client_ip,
+        auth_token=auth_header,
+        path=request.url.path
+    )
+    if mitigation.is_mitigated:
+        headers = {"X-Request-ID": request_id, "X-Decision": "BLOCK", **mitigation.headers}
+        return JSONResponse(
+            status_code=mitigation.http_status,
+            headers=headers,
+            content={
+                "error": "Access Denied" if mitigation.http_status == 403 else ("Too Many Requests" if mitigation.http_status == 429 else "Unauthorized"),
+                "request_id": request_id,
+                "message": mitigation.reason,
+                "mitigation_action": mitigation.action.name if mitigation.action else "ACTIVE_MITIGATION"
+            }
+        )
 
     # 2. Oversized payload verification
     content_length = request.headers.get("Content-Length")
@@ -417,6 +447,26 @@ async def security_pipeline_middleware(request: Request, call_next):
             reasons.append(auth_reason)
         else:
             user_principal = str(claims.get("sub", ""))
+            # Phase 8: Principal Active Mitigation Check (Suspended Account, MFA Challenge)
+            principal_mitigation = mitigation_engine.evaluate_request(
+                client_ip=client_ip,
+                principal_ref=user_principal,
+                auth_token=auth_header,
+                path=request.url.path
+            )
+            if principal_mitigation.is_mitigated:
+                headers = {"X-Request-ID": request_id, "X-Decision": "BLOCK", **principal_mitigation.headers}
+                return JSONResponse(
+                    status_code=principal_mitigation.http_status,
+                    headers=headers,
+                    content={
+                        "error": "Access Denied" if principal_mitigation.http_status == 403 else ("Too Many Requests" if principal_mitigation.http_status == 429 else "Unauthorized"),
+                        "request_id": request_id,
+                        "message": principal_mitigation.reason,
+                        "mitigation_action": principal_mitigation.action.name if principal_mitigation.action else "ACTIVE_MITIGATION"
+                    }
+                )
+
             # BOLA/IDOR Context Check
             is_authorized, bola_reason = auth_engine.check_bola_idor(request.url.path, claims)
             if not is_authorized:
