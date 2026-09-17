@@ -1,0 +1,26 @@
+{
+  "trained_at": "2026-09-16T19:19:28.681549+00:00",
+  "sample_count": 2711,
+  "feature_count": 16,
+  "feature_names": [
+    "request_count_1h",
+    "request_count_1d",
+    "unique_endpoints_1h",
+    "unique_endpoints_1d",
+    "request_size_deviation",
+    "response_time_deviation",
+    "hour_of_day",
+    "day_of_week",
+    "is_peak_hour",
+    "endpoint_entropy",
+    "time_between_requests",
+    "account_age_days",
+    "past_incident_count",
+    "device_diversity",
+    "payload_size_bytes",
+    "method_is_mutation"
+  ],
+  "contamination": 0.05,
+  "n_estimators": 50,
+  "model_type": "IsolationForest"
+}

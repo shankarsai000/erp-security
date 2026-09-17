@@ -13,6 +13,12 @@ class GatewayConfig:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     max_body_bytes: int = int(os.getenv("MAX_BODY_BYTES", "10485760"))  # 10 MB
     
+    # Phase 6 Machine Learning Anomaly Detection configuration
+    ml_enabled: bool = os.getenv("ML_ENABLED", "true").lower() == "true"
+    ml_canary_percentage: float = float(os.getenv("ML_CANARY_PERCENTAGE", "100.0"))
+    ml_model_dir: str = os.getenv("ML_MODEL_DIR", "ml/models")
+    ml_max_inference_ms: float = float(os.getenv("ML_MAX_INFERENCE_MS", "50.0"))
+
     # Policy threshold mapping: (min_inclusive, max_exclusive, decision_name)
     risk_policy: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         "ALLOW": (0.0, 20.0),
@@ -22,3 +28,4 @@ class GatewayConfig:
     })
 
 config = GatewayConfig()
+

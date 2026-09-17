@@ -26,6 +26,10 @@ from gateway.telemetry.event_pipeline import telemetry_pipeline
 from gateway.telemetry.redaction import pseudonymize_identifier, sanitize_telemetry
 from gateway.waf import inspect_content
 
+from ml.model_service import MLModelService
+from ml.feature_engineering import FeatureExtractor
+from collections import deque
+
 # Logging configuration
 logging.basicConfig(
     level=config.log_level,
@@ -40,6 +44,15 @@ rate_limiter = RateLimiter(
     redis_port=config.redis_port,
     redis_timeout=config.redis_timeout
 )
+
+# Initialize Phase 6 Machine Learning Anomaly Detection Service & Feature Extractor
+ml_service = MLModelService(
+    model_dir=config.ml_model_dir,
+    canary_percentage=config.ml_canary_percentage,
+    enabled=config.ml_enabled
+)
+ml_feature_extractor = FeatureExtractor()
+user_recent_events: dict[str, deque] = {}
 
 # Persistent HTTP Client with connection pooling for proxying
 http_client: Optional[httpx.AsyncClient] = None
@@ -96,7 +109,10 @@ def emit_audit_event(
     principal: str = "",
     fired_rules: Optional[List[str]] = None,
     anomaly_score: float = 0.0,
-    anomaly_reasons: Optional[List[str]] = None
+    anomaly_reasons: Optional[List[str]] = None,
+    ml_score: float = 0.0,
+    ml_confidence: float = 0.0,
+    ml_anomalous: bool = False
 ):
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -111,6 +127,10 @@ def emit_audit_event(
         "fired_rules": fired_rules or [],
         "anomaly_score": round(anomaly_score, 2),
         "anomaly_reasons": anomaly_reasons or [],
+        "ml_score": round(ml_score, 2),
+        "ml_confidence": round(ml_confidence, 2),
+        "ml_anomalous": ml_anomalous,
+        "ml_advisory": True,
         "reasons": risk_score.reasons,
         "latency_ms": round(latency_ms, 2),
         "user_agent": request.headers.get("User-Agent", "unknown")
@@ -138,6 +158,24 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+@app.get("/api/ml/health")
+async def ml_health_check():
+    """Advisory ML Model Service diagnostic status and performance metrics."""
+    return ml_service.get_health()
+
+@app.post("/api/ml/rollback")
+async def ml_emergency_rollback(reason: str = "Operator invoked emergency rollback"):
+    """Instant rollback procedure (< 30 seconds SLA). Halts ML scoring immediately."""
+    ml_service.rollback(reason=reason)
+    return {"status": "rolled_back", "reason": reason}
+
+@app.post("/api/ml/recover")
+async def ml_service_recover():
+    """Recover ML Service from rollback back into normal canary operation."""
+    ml_service.recover()
+    return {"status": "recovered", "health": ml_service.get_health()}
+
+
 @app.middleware("http")
 async def security_pipeline_middleware(request: Request, call_next):
     start_time = time.time()
@@ -146,8 +184,8 @@ async def security_pipeline_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = request_id
     
-    # Health endpoint bypasses security pipeline
-    if request.url.path == "/health":
+    # Health and management endpoints bypass proxying and security pipeline
+    if request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover"):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response
@@ -359,6 +397,45 @@ async def security_pipeline_middleware(request: Request, call_next):
     if anomaly_res.is_anomalous:
         reasons.extend(anomaly_res.reasons)
 
+    # Phase 6: Advisory Machine Learning Anomaly Detection (Canary evaluation)
+    ml_score = 0.0
+    ml_confidence = 0.0
+    ml_anomalous = False
+
+    uid_key = user_principal or client_ip
+    if uid_key not in user_recent_events:
+        user_recent_events[uid_key] = deque(maxlen=50)
+
+    now_utc = datetime.now(timezone.utc)
+    curr_event_record = {
+        "timestamp": now_utc.isoformat(),
+        "ts_epoch": time.time(),
+        "hour_of_day": now_utc.hour,
+        "day_of_week": now_utc.weekday(),
+        "user_id": uid_key,
+        "principal_ref": uid_key,
+        "path": request.url.path,
+        "method": request.method,
+        "client_ip": client_ip,
+        "user_agent": request.headers.get("User-Agent", "unknown"),
+        "request_size_bytes": len(body_bytes),
+        "latency_ms": (time.time() - start_time) * 1000.0,
+    }
+    user_recent_events[uid_key].append(curr_event_record)
+
+    if ml_service.should_evaluate_ml(request_id):
+        ml_features = ml_feature_extractor.extract_features(
+            user_events=list(user_recent_events[uid_key]),
+            baseline_engine=anomaly_detector.baseline_engine,
+            current_event=curr_event_record
+        )
+        ml_res = ml_service.score_request(ml_features)
+        ml_score = ml_res.ml_score
+        ml_confidence = ml_res.ml_confidence
+        ml_anomalous = ml_res.ml_anomalous
+        # CRITICAL CONSTRAINT: ML scores are strictly advisory.
+        # They are recorded in telemetry for analysis, but do NOT elevate risk decision to BLOCK.
+
     # 11. Rate Limiting Check
     rate_key = client_ip
     count, rate_severity = rate_limiter.check_rate(rate_key)
@@ -381,7 +458,8 @@ async def security_pipeline_middleware(request: Request, call_next):
     emit_audit_event(
         request_id, risk_score.decision, risk_score, request, elapsed_ms, client_ip,
         user_principal, fired_rules=fired_rules, anomaly_score=anomaly_res.score,
-        anomaly_reasons=anomaly_res.reasons
+        anomaly_reasons=anomaly_res.reasons, ml_score=ml_score, ml_confidence=ml_confidence,
+        ml_anomalous=ml_anomalous
     )
 
 
