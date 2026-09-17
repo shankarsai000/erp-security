@@ -34,6 +34,8 @@ from gateway.mitigation_engine import MitigationEngine, MitigationDecision, Unau
 from gateway.soc_feedback import soc_feedback_engine, FeedbackTag
 from gateway.security_metrics import security_metrics_tracker
 from ml.retraining_pipeline import ModelRetrainingPipeline
+from gateway.ha_dr import ha_manager, circuit_breaker
+from gateway.compliance import tamper_evident_audit_chain, compliance_reporter
 
 mitigation_engine = MitigationEngine()
 security_orchestrator.mitigation_engine = mitigation_engine
@@ -178,6 +180,13 @@ def emit_audit_event(
         except Exception as exc:
             logger.error(f"Error in SecurityOrchestrator: {exc}")
 
+    # 6. Phase 10: Cryptographic Tamper-Evident Audit Chaining
+    try:
+        tamper_evident_audit_chain.append_event(sanitized_event)
+    except Exception as exc:
+        logger.error(f"Failed to seal event into tamper-evident chain: {exc}")
+
+
 @app.get("/health")
 async def health_check():
     """Unprotected health liveness check."""
@@ -187,6 +196,25 @@ async def health_check():
         "version": "2.0.0",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
+
+@app.get("/health/live")
+async def health_liveness():
+    """Kubernetes liveness probe."""
+    return {"status": "alive", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/health/ready")
+async def health_readiness():
+    """Kubernetes deep readiness probe."""
+    is_ready, details = ha_manager.evaluate_readiness(
+        rules_engine=rules_engine,
+        ml_service=ml_service,
+        mitigation_engine=mitigation_engine,
+        rate_limiter=rate_limiter
+    )
+    status_code = 200 if is_ready else 503
+    return JSONResponse(status_code=status_code, content=details)
 
 @app.get("/api/ml/health")
 async def ml_health_check():
@@ -329,6 +357,33 @@ async def get_security_kpis():
     return security_metrics_tracker.get_kpis()
 
 
+# Phase 10: Compliance & HA Endpoints
+@app.get("/api/compliance/report")
+async def get_compliance_report():
+    """Generate multi-standard compliance report (SOC 2, ISO 27001, GDPR, SOX)."""
+    return compliance_reporter.generate_full_compliance_report()
+
+
+@app.post("/api/compliance/verify-chain")
+async def verify_audit_log_chain():
+    """Cryptographic audit log integrity validation."""
+    is_valid, count, err = tamper_evident_audit_chain.verify_chain()
+    return {
+        "chain_intact": is_valid,
+        "verified_blocks": count,
+        "integrity_error": err
+    }
+
+
+@app.get("/api/ha/status")
+async def get_ha_circuit_breaker_status():
+    """HA and circuit breaker diagnostics."""
+    return {
+        "circuit_breaker": circuit_breaker.get_status(),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 @app.middleware("http")
 async def security_pipeline_middleware(request: Request, call_next):
     start_time = time.time()
@@ -339,10 +394,17 @@ async def security_pipeline_middleware(request: Request, call_next):
     
     # Health and management endpoints bypass proxying and security pipeline
     if (
-        request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover", "/api/mitigations/status", "/api/ml/retrain", "/api/metrics/security")
+        request.url.path in (
+            "/health", "/health/live", "/health/ready",
+            "/api/ml/health", "/api/ml/rollback", "/api/ml/recover",
+            "/api/mitigations/status", "/api/ml/retrain", "/api/metrics/security",
+            "/api/ha/status", "/api/compliance/report", "/api/compliance/verify-chain"
+        )
         or request.url.path.startswith("/api/agents")
         or request.url.path.startswith("/api/soc")
         or request.url.path.startswith("/api/metrics")
+        or request.url.path.startswith("/api/compliance")
+        or request.url.path.startswith("/api/ha")
     ):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -705,6 +767,17 @@ async def security_pipeline_middleware(request: Request, call_next):
         )
 
     # 12. Forward Legitimate Traffic to Upstream ERP
+    if not circuit_breaker.allow_request():
+        return JSONResponse(
+            status_code=503,
+            headers={"X-Request-ID": request_id, "Retry-After": "10"},
+            content={
+                "error": "Service Unavailable",
+                "request_id": request_id,
+                "message": "Upstream ERP service temporarily isolated by circuit breaker protection"
+            }
+        )
+
     upstream_url = f"{config.backend_url}{request.url.path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
@@ -725,6 +798,7 @@ async def security_pipeline_middleware(request: Request, call_next):
             headers=forward_headers,
             content=body_bytes
         )
+        circuit_breaker.record_success()
         
         # Track failed logins for brute force defense
         if request.url.path == "/api/auth/login" and upstream_resp.status_code == 401:
@@ -754,6 +828,7 @@ async def security_pipeline_middleware(request: Request, call_next):
                 headers=forward_headers,
                 content=body_bytes
             )
+            circuit_breaker.record_success()
             response = Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
@@ -763,6 +838,7 @@ async def security_pipeline_middleware(request: Request, call_next):
             response.headers["X-Decision"] = risk_score.decision.value
             response.headers["X-Risk-Score"] = str(risk_score.overall)
             return response
+        circuit_breaker.record_failure(str(exc))
         logger.error(f"RuntimeError proxying request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,
@@ -774,7 +850,7 @@ async def security_pipeline_middleware(request: Request, call_next):
             }
         )
     except Exception as exc:
-
+        circuit_breaker.record_failure(str(exc))
         logger.error(f"Failed to proxy request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,
