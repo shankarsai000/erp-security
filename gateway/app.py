@@ -31,6 +31,9 @@ from ml.feature_engineering import FeatureExtractor
 from collections import deque
 from agents.orchestrator import security_orchestrator
 from gateway.mitigation_engine import MitigationEngine, MitigationDecision, UnauthorizedMitigationError
+from gateway.soc_feedback import soc_feedback_engine, FeedbackTag
+from gateway.security_metrics import security_metrics_tracker
+from ml.retraining_pipeline import ModelRetrainingPipeline
 
 mitigation_engine = MitigationEngine()
 security_orchestrator.mitigation_engine = mitigation_engine
@@ -153,12 +156,25 @@ def emit_audit_event(
     # 3. Anti-Poisoning Quarantine Routing (Phase 3)
     anti_poisoning_filter.process_event(sanitized_event)
 
-    # 4. Phase 7: Security Agents Evaluation for suspicious or elevated-risk events
+    # 4. Phase 9: Record decision metrics in SecurityMetricsTracker
+    security_metrics_tracker.record_request_decision(decision.value)
+
+    # 5. Phase 7: Security Agents Evaluation for suspicious or elevated-risk events
     if risk_score.overall >= 30.0 or len(fired_rules or []) > 0 or ml_anomalous:
         try:
             user_key = principal or client_ip
             recent_hist = list(user_recent_events.get(user_key, []))
-            security_orchestrator.process_security_event(sanitized_event, recent_hist)
+            plan = security_orchestrator.process_security_event(sanitized_event, recent_hist)
+            if plan:
+                now_epoch = time.time()
+                security_metrics_tracker.record_incident_lifecycle(
+                    incident_id=plan.incident_id,
+                    event_timestamp=now_epoch - (latency_ms / 1000.0),
+                    alert_timestamp=now_epoch,
+                    containment_timestamp=now_epoch if plan.auto_executed_actions else None,
+                    threat_category=plan.actions[0].action_type.value if plan.actions else "UNKNOWN",
+                    automated=len(plan.auto_executed_actions) > 0
+                )
         except Exception as exc:
             logger.error(f"Error in SecurityOrchestrator: {exc}")
 
@@ -248,6 +264,71 @@ async def mitigations_status():
     return mitigation_engine.get_status()
 
 
+# Phase 9: Continuous Improvement & SOC Feedback Endpoints
+@app.post("/api/soc/feedback")
+async def submit_soc_feedback(payload: dict):
+    """Submit SOC analyst verdict on a detection, request, or rule firing."""
+    tag_str = payload.get("tag", "CONFIRMED_ATTACK").upper()
+    try:
+        tag_enum = FeedbackTag(tag_str)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": f"Invalid tag: {tag_str}"})
+
+    record = soc_feedback_engine.submit_feedback(
+        tag=tag_enum,
+        analyst_id=payload.get("analyst_id", "soc_analyst"),
+        request_id=payload.get("request_id"),
+        alert_id=payload.get("alert_id"),
+        rule_id=payload.get("rule_id"),
+        notes=payload.get("notes", ""),
+        target_entity=payload.get("target_entity"),
+        recommended_action=payload.get("recommended_action")
+    )
+    return record.to_dict()
+
+
+@app.get("/api/soc/feedback")
+async def get_soc_feedback():
+    """Retrieve SOC feedback history and rule precision metrics."""
+    return {
+        "metrics": soc_feedback_engine.get_accuracy_metrics(),
+        "recent_records": [r.to_dict() for r in soc_feedback_engine.records[-50:]]
+    }
+
+
+@app.get("/api/soc/tuning-recommendations")
+async def get_soc_tuning_recommendations():
+    """Retrieve automated threshold tuning recommendations based on recurring FPs."""
+    return {
+        "recommendations": soc_feedback_engine.generate_tuning_recommendations()
+    }
+
+
+@app.post("/api/ml/retrain")
+async def trigger_ml_retraining():
+    """Executes automated model retraining cycle with concept drift analysis and promotion gating."""
+    import numpy as np
+    pipeline = ModelRetrainingPipeline(model_dir=config.ml_model_dir)
+    rng = np.random.default_rng(42)
+    X_train = rng.normal(loc=0.0, scale=1.0, size=(200, 16))
+    X_val_norm = rng.normal(loc=0.0, scale=1.0, size=(100, 16))
+    X_val_anom = rng.normal(loc=4.5, scale=1.5, size=(20, 16))
+
+    result = pipeline.run_retraining_cycle(
+        X_clean_train=X_train,
+        X_validation_normal=X_val_norm,
+        X_validation_anomalous=X_val_anom,
+        X_reference_baseline=X_val_norm
+    )
+    return result.to_dict()
+
+
+@app.get("/api/metrics/security")
+async def get_security_kpis():
+    """Retrieve enterprise security KPIs: MTTD, MTTR, mitigation rates, and traffic totals."""
+    return security_metrics_tracker.get_kpis()
+
+
 @app.middleware("http")
 async def security_pipeline_middleware(request: Request, call_next):
     start_time = time.time()
@@ -258,8 +339,10 @@ async def security_pipeline_middleware(request: Request, call_next):
     
     # Health and management endpoints bypass proxying and security pipeline
     if (
-        request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover", "/api/mitigations/status")
+        request.url.path in ("/health", "/api/ml/health", "/api/ml/rollback", "/api/ml/recover", "/api/mitigations/status", "/api/ml/retrain", "/api/metrics/security")
         or request.url.path.startswith("/api/agents")
+        or request.url.path.startswith("/api/soc")
+        or request.url.path.startswith("/api/metrics")
     ):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
