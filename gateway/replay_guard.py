@@ -10,16 +10,24 @@ import time
 from typing import List, Optional, Tuple
 
 
+from gateway.state_store import DistributedStateStore, state_store as global_state_store
+
+
 class ReplayGuard:
     """
     Prevents replaying of sensitive state-changing operations.
-    Enforces freshness window and single-use idempotency/nonce guarantees.
+    Enforces freshness window and single-use idempotency/nonce guarantees across
+    horizontal replicas using Redis atomic primitives with thread-safe in-memory fallback.
     """
 
-    def __init__(self, max_skew_seconds: int = 300):
+    def __init__(self, max_skew_seconds: int = 300, state_store: Optional[DistributedStateStore] = None):
         self.max_skew_seconds = max_skew_seconds
-        self._lock = threading.Lock()
-        self._seen_nonces = {}  # key -> expiry timestamp
+        self.state_store = state_store or global_state_store
+
+    @property
+    def _seen_nonces(self):
+        """Backward compatibility accessor for legacy test inspections."""
+        return self.state_store.fallback._nonces
 
     def validate_request(
         self,
@@ -34,15 +42,7 @@ class ReplayGuard:
         """
         now = time.time()
 
-        # 1. Cleanup expired nonces
-        with self._lock:
-            expired_keys = [k for k, exp in self._seen_nonces.items() if exp < now]
-            for k in expired_keys:
-                del self._seen_nonces[k]
-
-        reasons = []
-
-        # 2. Timestamp Freshness Check
+        # 1. Timestamp Freshness Check
         if timestamp_str:
             try:
                 ts = float(timestamp_str)
@@ -54,15 +54,14 @@ class ReplayGuard:
             except ValueError:
                 return True, 80, ["Malformed timestamp header in request"]
 
-        # 3. Nonce / Idempotency Key Uniqueness Check
+        # 2. Nonce / Idempotency Key Uniqueness Check via Distributed Store
         unique_key = nonce or idempotency_key
         if unique_key:
-            with self._lock:
-                if unique_key in self._seen_nonces:
-                    return True, 95, [
-                        f"Transaction replay detected: nonce/idempotency key '{unique_key}' already executed"
-                    ]
-                self._seen_nonces[unique_key] = now + self.max_skew_seconds
+            is_unique = self.state_store.set_nonce_nx(unique_key, ttl_seconds=self.max_skew_seconds)
+            if not is_unique:
+                return True, 95, [
+                    f"Transaction replay detected: nonce/idempotency key '{unique_key}' already executed"
+                ]
 
         return False, 0, []
 

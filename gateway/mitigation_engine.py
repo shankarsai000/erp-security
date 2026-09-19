@@ -34,15 +34,22 @@ class MitigationDecision:
     action_id: Optional[str] = None
 
 
+from gateway.state_store import DistributedStateStore, state_store as global_state_store
+
+
 class MitigationEngine:
-    """Thread-safe active mitigation registry and enforcement engine."""
+    """Thread-safe active mitigation registry and enforcement engine.
+    Supports shared distributed Redis backing for multi-replica Kubernetes clusters
+    with seamless local thread-safe in-memory fallback.
+    """
 
     MAX_AUTO_QUARANTINE_SECONDS: int = 3600  # Strict policy: Max 1 hour for automated IP quarantines
 
-    def __init__(self):
+    def __init__(self, state_store: Optional[DistributedStateStore] = None):
         self._lock = threading.RLock()
+        self.state_store = state_store or global_state_store
 
-        # Active mitigations
+        # Active mitigations (local in-memory caches)
         # IP -> {"until": datetime.datetime, "reason": str, "action_id": str}
         self.quarantined_ips: Dict[str, dict] = {}
 
@@ -105,6 +112,12 @@ class MitigationEngine:
                     "reason": action.justification,
                     "action_id": action.action_id
                 }
+                self.state_store.set_hash_entry(
+                    "quarantined_ips",
+                    action.target_entity,
+                    {"until": until.isoformat(), "reason": action.justification, "action_id": action.action_id},
+                    ttl_seconds=duration
+                )
                 self._action_registry[action.action_id] = (action.action_type, action.target_entity)
                 return True
 
@@ -113,12 +126,19 @@ class MitigationEngine:
                 if action.target_entity.startswith("Bearer ") or len(action.target_entity) > 32:
                     clean_token = action.target_entity.replace("Bearer ", "").strip()
                     self.revoked_tokens.add(clean_token)
+                    self.state_store.add_to_set("revoked_tokens", clean_token)
                 else:
                     self.revoked_principals[action.target_entity] = {
                         "until": until,
                         "reason": action.justification,
                         "action_id": action.action_id
                     }
+                    self.state_store.set_hash_entry(
+                        "revoked_principals",
+                        action.target_entity,
+                        {"until": until.isoformat(), "reason": action.justification, "action_id": action.action_id},
+                        ttl_seconds=duration
+                    )
                 self._action_registry[action.action_id] = (action.action_type, action.target_entity)
                 return True
 
@@ -149,6 +169,16 @@ class MitigationEngine:
                     "timestamp": now.isoformat(),
                     "reason": action.justification
                 }
+                self.state_store.set_hash_entry(
+                    "suspended_accounts",
+                    action.target_entity,
+                    {
+                        "action_id": action.action_id,
+                        "approved_by": action.approved_by or "HUMAN_ANALYST",
+                        "timestamp": now.isoformat(),
+                        "reason": action.justification
+                    }
+                )
                 self._action_registry[action.action_id] = (action.action_type, action.target_entity)
                 return True
 
@@ -164,16 +194,20 @@ class MitigationEngine:
 
             if action_type == ActionType.QUARANTINE_IP_TEMP:
                 self.quarantined_ips.pop(target, None)
+                self.state_store.delete_hash_entry("quarantined_ips", target)
             elif action_type == ActionType.REVOKE_SESSION:
                 clean_token = target.replace("Bearer ", "").strip()
                 self.revoked_tokens.discard(clean_token)
+                self.state_store.remove_from_set("revoked_tokens", clean_token)
                 self.revoked_principals.pop(target, None)
+                self.state_store.delete_hash_entry("revoked_principals", target)
             elif action_type == ActionType.CHALLENGE_MFA:
                 self.mfa_enforced_principals.pop(target, None)
             elif action_type == ActionType.RATE_LIMIT:
                 self.dynamic_rate_limits.pop(target, None)
             elif action_type == ActionType.SUSPEND_ACCOUNT:
                 self.suspended_accounts.pop(target, None)
+                self.state_store.delete_hash_entry("suspended_accounts", target)
 
             del self._action_registry[action_id]
             return True
@@ -194,20 +228,33 @@ class MitigationEngine:
 
         with self._lock:
             # 1. Evaluate Suspended Accounts (Strict Human Approved)
-            if principal_ref and principal_ref in self.suspended_accounts:
-                info = self.suspended_accounts[principal_ref]
+            suspended_info = self.suspended_accounts.get(principal_ref) if principal_ref else None
+            if not suspended_info and principal_ref:
+                suspended_info = self.state_store.get_hash_entry("suspended_accounts", principal_ref)
+            if suspended_info:
                 return MitigationDecision(
                     is_mitigated=True,
                     action=ActionType.SUSPEND_ACCOUNT,
                     http_status=403,
                     reason=f"Account '{principal_ref}' is suspended by security policy. Contact administrator.",
-                    action_id=info["action_id"]
+                    action_id=suspended_info["action_id"]
                 )
 
             # 2. Evaluate Temporary IP/Entity Quarantine with TTL auto-expiry
             quarantine_key = client_ip if client_ip in self.quarantined_ips else (principal_ref if principal_ref and principal_ref in self.quarantined_ips else None)
-            if quarantine_key:
-                info = self.quarantined_ips[quarantine_key]
+            info = self.quarantined_ips.get(quarantine_key) if quarantine_key else None
+            if not info:
+                for candidate in (client_ip, principal_ref):
+                    if candidate:
+                        raw_info = self.state_store.get_hash_entry("quarantined_ips", candidate)
+                        if raw_info:
+                            quarantine_key = candidate
+                            until_raw = raw_info.get("until")
+                            until_dt = datetime.datetime.fromisoformat(until_raw) if isinstance(until_raw, str) else until_raw
+                            info = {"until": until_dt, "reason": raw_info.get("reason", ""), "action_id": raw_info.get("action_id", "")}
+                            break
+
+            if quarantine_key and info:
                 if now <= info["until"]:
                     remaining_seconds = max(1, int((info["until"] - now).total_seconds()))
                     return MitigationDecision(
@@ -220,12 +267,13 @@ class MitigationEngine:
                     )
                 else:
                     # Clean TTL auto-expiry
-                    del self.quarantined_ips[quarantine_key]
+                    self.quarantined_ips.pop(quarantine_key, None)
+                    self.state_store.delete_hash_entry("quarantined_ips", quarantine_key)
 
             # 3. Evaluate Revoked Tokens or Principal Sessions
             if auth_token:
                 clean_token = auth_token.replace("Bearer ", "").strip()
-                if clean_token in self.revoked_tokens:
+                if clean_token in self.revoked_tokens or self.state_store.is_member("revoked_tokens", clean_token):
                     return MitigationDecision(
                         is_mitigated=True,
                         action=ActionType.REVOKE_SESSION,

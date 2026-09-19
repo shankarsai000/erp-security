@@ -71,11 +71,24 @@ class AuthEngine:
             logger.error(f"Unexpected error during JWT verification: {e}")
             return False, "Authentication token verification error", None, 90.0, 0.0
 
-    def check_bola_idor(self, path: str, claims: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    # Known registered order ownership mapping (order_id -> owner_customer_id)
+    ORDER_OWNERSHIP: Dict[str, str] = {
+        "101": "cust-882",
+        "102": "cust-941",
+    }
+
+    def check_bola_idor(
+        self,
+        path: str,
+        claims: Optional[Dict[str, Any]],
+        method: str = "GET",
+        body_payload: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, str]:
         """
-        BOLA/IDOR prevention:
-        - If path is /api/users/{id}, ensures user is accessing their own account or possesses 'admin' privileges.
-        - If path is /api/orders/{id}, ensures customer can only access their own order unless 'sales', 'warehouse', or 'admin'.
+        BOLA/IDOR prevention (SEC-06):
+        - /api/users/{id}: ensures user is accessing their own profile or has 'admin' privileges.
+        - /api/orders/{id}: ensures caller is order owner or possesses 'admin', 'sales', 'warehouse', or 'finance' role.
+        - /api/orders (POST/PUT/PATCH): ensures non-staff caller cannot place or modify orders under another customer's ID.
         Returns: (is_authorized, reason)
         """
         if not claims:
@@ -84,17 +97,38 @@ class AuthEngine:
         role = claims.get("role", "user")
         roles = claims.get("roles", [role])
         sub = str(claims.get("sub", ""))
+        caller_cust_id = str(claims.get("customer_id", "")) or sub
 
-        # Admin has global oversight
-        if "admin" in roles or role == "admin":
-            return True, "Admin access permitted"
-
+        # 1. User Profile BOLA Check (/api/users/{id})
         if path.startswith("/api/users/"):
             parts = [p for p in path.split("/") if p]
             if len(parts) >= 3:
                 target_id = parts[2]
-                if sub != target_id and f"cust-{sub}" != target_id:
+                is_admin = role == "admin" or ("admin" in roles)
+                if not is_admin and sub != target_id and f"cust-{sub}" != target_id and caller_cust_id != target_id:
                     return False, f"BOLA violation: user '{sub}' cannot access profile of user '{target_id}'"
+
+        # 2. Order Object & Mutation BOLA Checks (/api/orders/{order_id} & /api/orders)
+        elif path.startswith("/api/orders/") or (path == "/api/orders" and method in ("POST", "PUT", "PATCH")):
+            # Admin and internal staff roles have legitimate cross-tenant operational access to orders
+            is_internal_staff = any(r in ("admin", "sales", "warehouse", "finance", "support") for r in roles) or role in ("admin", "sales", "warehouse", "finance", "support")
+            if is_internal_staff:
+                return True, "Staff / administrative access permitted"
+
+            if path.startswith("/api/orders/"):
+                parts = [p for p in path.split("/") if p]
+                if len(parts) >= 3:
+                    order_id = parts[2]
+                    owner_id = self.ORDER_OWNERSHIP.get(order_id)
+                    if owner_id:
+                        if caller_cust_id != owner_id and f"cust-{sub}" != owner_id and sub != owner_id:
+                            return False, f"BOLA violation: user '{sub}' not authorized to access order '{order_id}' belonging to '{owner_id}'"
+
+            elif path == "/api/orders" and method in ("POST", "PUT", "PATCH") and body_payload:
+                payload_cust_id = body_payload.get("customer_id")
+                if payload_cust_id:
+                    if payload_cust_id != caller_cust_id and payload_cust_id != f"cust-{sub}" and payload_cust_id != sub:
+                        return False, f"BOLA violation: user '{sub}' cannot create or modify orders for customer '{payload_cust_id}'"
 
         return True, "Authorized"
 

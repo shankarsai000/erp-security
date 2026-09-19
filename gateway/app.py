@@ -719,19 +719,25 @@ async def security_pipeline_middleware(request: Request, call_next):
                     }
                 )
 
-            # BOLA/IDOR Context Check
-            is_authorized, bola_reason = auth_engine.check_bola_idor(request.url.path, claims)
-            if not is_authorized:
-                reasons.append(bola_reason)
-                waf_severity = max(waf_severity, 95.0)  # Hard block IDOR tampering
-
-    # 9. Phase 4: Deterministic Business Logic Rules Engine
+    # 9. Request Body Payload Parsing
     payload_dict = {}
     if body_text:
         try:
             payload_dict = json.loads(body_text) if isinstance(body_text, str) and body_text.strip().startswith(("{", "[")) else {}
         except Exception:
             payload_dict = {}
+
+    if not is_auth_exempt and 'claims' in locals() and claims:
+        # BOLA/IDOR Context Check (SEC-06)
+        is_authorized, bola_reason = auth_engine.check_bola_idor(
+            request.url.path,
+            claims,
+            method=request.method,
+            body_payload=payload_dict
+        )
+        if not is_authorized:
+            reasons.append(bola_reason)
+            waf_severity = max(waf_severity, 95.0)  # Hard block IDOR tampering
 
     current_role = ""
     if not is_auth_exempt and 'claims' in locals() and claims:

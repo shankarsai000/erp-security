@@ -1,9 +1,9 @@
 """Cryptographic Tamper-Evident Audit Logging & Multi-Standard Compliance Engine (Phase 10).
 
 Provides:
-1. Tamper-evident cryptographic log chaining using HMAC-SHA256 (RFC 6962 / Merkle chaining).
+1. Tamper-evident cryptographic log chaining using Sequential HMAC-SHA256 Block Chaining.
 2. Continuous non-repudiation verification detecting any unauthorized insertion, deletion, or modification.
-3. Automated compliance reporting for SOC 2 Type II, ISO 27001, GDPR Art 32, and SOX 404.
+3. Automated compliance evidence collection for SOC 2 Type II, ISO 27001, GDPR Art 32, and SOX 404.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -151,15 +151,16 @@ class ComplianceReportGenerator:
             "gateway_service": "erp-security-gateway",
             "environment": "production-ready",
             "overall_compliance_status": "COMPLIANT" if is_chain_valid else "NON_COMPLIANT_TAMPER_DETECTED",
+            "audit_disclaimer": "This report verifies technical control telemetry and evidence readiness. Formal certification requires examination by an accredited independent third-party auditor.",
             "audit_trail_integrity": {
                 "chain_valid": is_chain_valid,
                 "verified_blocks": verified_blocks,
                 "integrity_error": chain_err,
-                "cryptographic_algorithm": "HMAC-SHA256 (RFC 6962)"
+                "cryptographic_algorithm": "Sequential HMAC-SHA256 Block Chaining"
             },
             "frameworks": {
                 "SOC_2_TYPE_II": {
-                    "status": "ATTESTED_COMPLIANT",
+                    "status": "EVIDENCE_COLLECTED_CONTROLS_ACTIVE",
                     "criteria_evaluated": [
                         {"control": "CC6.1 Logical Access Controls", "status": "PASS", "evidence": "JWT HMAC-SHA256 signature verification and BOLA/IDOR authorization."},
                         {"control": "CC6.6 Boundary Protection", "status": "PASS", "evidence": "Multi-vector deterministic WAF (SQLi, XSS, Path Traversal) and IP rate limiting."},
@@ -168,7 +169,7 @@ class ComplianceReportGenerator:
                     ]
                 },
                 "ISO_IEC_27001_2022": {
-                    "status": "ATTESTED_COMPLIANT",
+                    "status": "EVIDENCE_COLLECTED_CONTROLS_ACTIVE",
                     "controls_evaluated": [
                         {"control": "A.8.7 Protection Against Malware & Injections", "status": "PASS", "evidence": "WAF pattern inspection with pure deterministic bounds."},
                         {"control": "A.8.16 Monitoring & Anti-Poisoning", "status": "PASS", "evidence": "Zero-PII telemetry pipeline with 3-tier anti-poisoning baseline gating."},
@@ -176,7 +177,7 @@ class ComplianceReportGenerator:
                     ]
                 },
                 "GDPR_ARTICLE_32": {
-                    "status": "ATTESTED_COMPLIANT",
+                    "status": "EVIDENCE_COLLECTED_CONTROLS_ACTIVE",
                     "safeguards_evaluated": [
                         {"safeguard": "Data Pseudonymization", "status": "PASS", "evidence": "User identifiers and IPs are pseudonymized via HMAC-SHA256 with daily rotating salt."},
                         {"safeguard": "Zero-PII Telemetry", "status": "PASS", "evidence": "Strict redaction removes SSNs, credit cards, emails, and passwords prior to logging."},
@@ -184,7 +185,7 @@ class ComplianceReportGenerator:
                     ]
                 },
                 "SOX_SECTION_404": {
-                    "status": "ATTESTED_COMPLIANT",
+                    "status": "EVIDENCE_COLLECTED_CONTROLS_ACTIVE",
                     "controls_evaluated": [
                         {"control": "Financial ERP Transaction Integrity", "status": "PASS", "evidence": "Rules Engine R001 strictly blocks negative and zero price orders."},
                         {"control": "Duplicate Payment Prevention", "status": "PASS", "evidence": "Rule R002 prevents duplicate orders submitted within 5-second window."},
