@@ -4,7 +4,9 @@ from gateway.app import app
 
 client = TestClient(app, raise_server_exceptions=False)
 
-VALID_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzYWxlc19qb2huIiwicm9sZSI6InNhbGVzIn0.c2ltdWxhdGVkX3NpZw"
+from gateway.auth_engine import auth_engine
+
+VALID_JWT = auth_engine.generate_token("sales_john", roles=["sales"], expires_in_seconds=3600)
 
 class TestHealthAndBypass:
     def test_health_endpoint_accessible_without_auth(self):

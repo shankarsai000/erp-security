@@ -37,11 +37,18 @@ INVENTORY = [
     {"sku": "SKU-9903", "name": "Hydraulic Pump v2", "quantity": 34, "warehouse": "West-1"},
 ]
 
+import jwt
+from gateway.config import config
+
 def make_mock_jwt(sub: str, role: str) -> str:
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
-    payload = base64.urlsafe_b64encode(json.dumps({"sub": sub, "role": role, "exp": int(time.time()) + 3600}).encode()).decode().rstrip("=")
-    sig = base64.urlsafe_b64encode(b"simulated_mock_cryptographic_signature").decode().rstrip("=")
-    return f"{header}.{payload}.{sig}"
+    payload = {
+        "sub": sub,
+        "role": role,
+        "roles": [role],
+        "exp": int(time.time()) + 3600,
+        "iat": int(time.time()),
+    }
+    return jwt.encode(payload, config.jwt_secret_key, algorithm=config.jwt_algorithm)
 
 @fake_erp.get("/health")
 async def health():

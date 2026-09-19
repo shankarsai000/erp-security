@@ -10,15 +10,10 @@ from gateway.replay_guard import replay_guard
 
 client = TestClient(app, raise_server_exceptions=False)
 
+from gateway.auth_engine import auth_engine
+
 def make_jwt(sub: str, role: str, exp_offset: int = 3600) -> str:
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
-    payload = base64.urlsafe_b64encode(json.dumps({
-        "sub": sub,
-        "role": role,
-        "exp": int(time.time()) + exp_offset
-    }).encode()).decode().rstrip("=")
-    sig = base64.urlsafe_b64encode(b"simulated_mock_cryptographic_signature").decode().rstrip("=")
-    return f"{header}.{payload}.{sig}"
+    return auth_engine.generate_token(principal_id=sub, roles=[role], expires_in_seconds=exp_offset)
 
 SALES_TOKEN = make_jwt("sales_john", "sales")
 ADMIN_TOKEN = make_jwt("admin", "admin")

@@ -10,15 +10,10 @@ from gateway.rules_engine import RulesEngine, rules_engine
 
 client = TestClient(app, raise_server_exceptions=False)
 
+from gateway.auth_engine import auth_engine
+
 def make_jwt(sub: str, role: str, exp_offset: int = 3600) -> str:
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
-    payload = base64.urlsafe_b64encode(json.dumps({
-        "sub": sub,
-        "role": role,
-        "exp": int(time.time()) + exp_offset
-    }).encode()).decode().rstrip("=")
-    sig = base64.urlsafe_b64encode(b"simulated_mock_cryptographic_signature").decode().rstrip("=")
-    return f"{header}.{payload}.{sig}"
+    return auth_engine.generate_token(principal_id=sub, roles=[role], expires_in_seconds=exp_offset)
 
 SALES_TOKEN = make_jwt("sales_john", "sales")
 ADMIN_TOKEN = make_jwt("admin", "admin")
@@ -209,7 +204,10 @@ class TestGatewayRulesIntegration:
         # Item format "SKU-9901:500" exceeds available stock of 420
         response = client.post(
             "/api/orders",
-            headers={"Authorization": f"Bearer {SALES_TOKEN}"},
+            headers={
+                "Authorization": f"Bearer {SALES_TOKEN}",
+                "Idempotency-Key": f"idemp-deplete-{uuid.uuid4().hex}"
+            },
             json={
                 "customer_id": "cust-888",
                 "items": ["SKU-9901:500"],
@@ -228,14 +226,27 @@ class TestGatewayRulesIntegration:
             "items": ["Industrial Widget A"],
             "total_amount": 120.0
         }
-        headers = {"Authorization": f"Bearer {SALES_TOKEN}"}
 
         # First request succeeds
-        resp1 = client.post("/api/orders", headers=headers, json=order_payload)
+        resp1 = client.post(
+            "/api/orders",
+            headers={
+                "Authorization": f"Bearer {SALES_TOKEN}",
+                "Idempotency-Key": f"idemp-dupe-1-{uuid.uuid4().hex}"
+            },
+            json=order_payload
+        )
         assert resp1.status_code == 200
 
         # Duplicate immediate request triggers R002 (elevates risk score)
-        resp2 = client.post("/api/orders", headers=headers, json=order_payload)
+        resp2 = client.post(
+            "/api/orders",
+            headers={
+                "Authorization": f"Bearer {SALES_TOKEN}",
+                "Idempotency-Key": f"idemp-dupe-2-{uuid.uuid4().hex}"
+            },
+            json=order_payload
+        )
         assert resp2.headers["X-Decision"] in ["CHALLENGE", "LIMIT", "BLOCK"]
         data = resp2.json()
         if "reasons" in data:
@@ -250,6 +261,7 @@ class TestGatewayRulesIntegration:
         }
         headers = {
             "Authorization": f"Bearer {SALES_TOKEN}",
+            "Idempotency-Key": f"idemp-valid-{uuid.uuid4().hex}",
             "X-Forwarded-For": f"10.201.{uuid.uuid4().hex[:4]}"
         }
 

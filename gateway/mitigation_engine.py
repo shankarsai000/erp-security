@@ -12,6 +12,10 @@ import threading
 from typing import Dict, Optional, Set, Tuple
 
 from agents.base import ActionType, AgentAction, ApprovalStatus
+from gateway.config import config
+import logging
+
+logger = logging.getLogger("erp_security.mitigation")
 
 
 class UnauthorizedMitigationError(Exception):
@@ -79,7 +83,16 @@ class MitigationEngine:
             now = datetime.datetime.now(datetime.timezone.utc)
             duration = action.duration_seconds or 900
 
-            # 2. Cap automated IP quarantines to safety threshold
+            # 2. Prevent DoS on whitelisted corporate, internal, or loopback IPs (SEC-05)
+            if action.action_type in (ActionType.QUARANTINE_IP_TEMP, ActionType.BLOCK_CIDR_ORGANIZATION):
+                if config.is_ip_whitelisted(action.target_entity):
+                    logger.warning(
+                        "Attempted to quarantine whitelisted internal/corporate IP '%s'. Mitigation rejected.",
+                        action.target_entity
+                    )
+                    return False
+
+            # 3. Cap automated IP quarantines to safety threshold
             if action.action_type == ActionType.QUARANTINE_IP_TEMP:
                 duration = min(duration, self.MAX_AUTO_QUARANTINE_SECONDS)
 

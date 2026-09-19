@@ -18,21 +18,23 @@ from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
-COMPLIANCE_SIGNING_SECRET = "erp_gateway_enterprise_tamper_evident_secret_key_2026"
+from gateway.config import config
+
 GENESIS_HASH = "0" * 64
 
 
 class TamperEvidentAuditChain:
-    """Maintains an append-only, cryptographically-chained audit trail."""
+    """Maintains an append-only, cryptographically-chained audit trail using HMAC-SHA256."""
 
     def __init__(
         self,
         audit_file: str = "events/tamper_evident_audit.jsonl",
-        secret: str = COMPLIANCE_SIGNING_SECRET
+        secret: Optional[str] = None
     ):
         self.audit_file = Path(audit_file)
         self.audit_file.parent.mkdir(parents=True, exist_ok=True)
-        self.secret = secret.encode("utf-8")
+        raw_secret = secret or config.compliance_signing_secret
+        self.secret = raw_secret.encode("utf-8")
         self._lock = threading.RLock()
         self.last_hash = GENESIS_HASH
         self.block_count = 0

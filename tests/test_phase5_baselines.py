@@ -25,8 +25,10 @@ from gateway.anomaly_detection.deterministic_anomaly_detector import (
 from gateway.telemetry.anti_poisoning import AntiPoisoningFilter, EventTier
 import gateway.app as gateway_module
 
+from gateway.auth_engine import auth_engine
+
 client = TestClient(app, raise_server_exceptions=False)
-SALES_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzYWxlc19qb2huIiwicm9sZSI6InNhbGVzIn0.c2ltdWxhdGVkX3NpZw"
+SALES_TOKEN = auth_engine.generate_token("sales_john", roles=["sales"], expires_in_seconds=3600)
 
 @pytest.fixture
 def sample_clean_events_file(tmp_path):

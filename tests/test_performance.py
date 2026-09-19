@@ -11,10 +11,10 @@ from gateway.rules_engine import rules_engine
 
 client = TestClient(app, raise_server_exceptions=False)
 
+from gateway.auth_engine import auth_engine
+
 def make_jwt(username: str, role: str = "sales") -> str:
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
-    payload = base64.urlsafe_b64encode(json.dumps({"sub": username, "role": role}).encode()).decode().rstrip("=")
-    return f"{header}.{payload}.simulated_sig"
+    return auth_engine.generate_token(username=username, roles=[role], expires_in_seconds=3600)
 
 VALID_JWT = make_jwt("sales_john")
 

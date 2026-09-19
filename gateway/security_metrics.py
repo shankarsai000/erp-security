@@ -61,20 +61,26 @@ class SecurityMetricsTracker:
     def record_incident_lifecycle(
         self,
         incident_id: str,
-        event_time_epoch: float,
-        alert_time_epoch: float,
+        event_time_epoch: Optional[float] = None,
+        alert_time_epoch: Optional[float] = None,
         containment_time_epoch: Optional[float] = None,
         threat_category: str = "UNKNOWN",
-        automated: bool = True
+        automated: bool = True,
+        event_timestamp: Optional[float] = None,
+        alert_timestamp: Optional[float] = None,
+        containment_timestamp: Optional[float] = None
     ) -> None:
         """Records an incident from detection through response for MTTD and MTTR computation."""
+        ev_time = event_time_epoch if event_time_epoch is not None else (event_timestamp or time.time())
+        al_time = alert_time_epoch if alert_time_epoch is not None else (alert_timestamp or time.time())
+        ct_time = containment_time_epoch if containment_time_epoch is not None else containment_timestamp
         with self._lock:
             self.incident_history.append(
                 IncidentMetric(
                     incident_id=incident_id,
-                    event_timestamp=event_time_epoch,
-                    alert_timestamp=alert_time_epoch,
-                    containment_timestamp=containment_time_epoch,
+                    event_timestamp=ev_time,
+                    alert_timestamp=al_time,
+                    containment_timestamp=ct_time,
                     threat_category=threat_category,
                     automated=automated
                 )

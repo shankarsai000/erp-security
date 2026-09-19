@@ -23,8 +23,20 @@ from gateway.schemas import LoginSchema, OrderCreateSchema
 from gateway.telemetry.anti_poisoning import anti_poisoning_filter
 
 from gateway.telemetry.event_pipeline import telemetry_pipeline
-from gateway.telemetry.redaction import pseudonymize_identifier, sanitize_telemetry
+from gateway.telemetry.redaction import pseudonymize_identifier, sanitize_telemetry, mask_ip
 from gateway.waf import inspect_content
+
+
+def get_verified_client_ip(request: Request) -> str:
+    """Extracts client IP, validating against trusted reverse proxies (SEC-05)."""
+    peer_ip = request.client.host if request.client else "127.0.0.1"
+    if config.is_trusted_proxy(peer_ip):
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            hops = [h.strip() for h in xff.split(",") if h.strip()]
+            if hops:
+                return hops[0]
+    return peer_ip
 
 from ml.model_service import MLModelService
 from ml.feature_engineering import FeatureExtractor
@@ -101,6 +113,7 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup_event():
+    config.validate_production_secrets()
     get_http_client()
     logger.info("Security Gateway initialized with upstream pool to %s", config.backend_url)
 
@@ -130,7 +143,8 @@ def emit_audit_event(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": request_id,
         "principal_ref": pseudonymize_identifier(principal or client_ip),
-        "client_ip": client_ip,
+        "client_ip": pseudonymize_identifier(client_ip),
+        "client_subnet": mask_ip(client_ip),
         "method": request.method,
         "path": request.url.path,
         "decision": decision.value,
@@ -453,7 +467,7 @@ async def security_pipeline_middleware(request: Request, call_next):
         response.headers["X-Request-ID"] = request_id
         return response
 
-    client_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "127.0.0.1")
+    client_ip = get_verified_client_ip(request)
     reasons = []
 
     # Phase 8: Active IP & Token Mitigation Check (Fast O(1) Pre-Routing Drop)
@@ -599,11 +613,38 @@ async def security_pipeline_middleware(request: Request, call_next):
                 content={"error": "Unprocessable Entity", "request_id": request_id, "message": f"Schema validation failed: {e}"}
             )
 
-    # 7. Replay Protection Guard
-    if request.method in ["POST", "PUT", "DELETE"]:
+    # 7. Replay Protection Guard & Freshness Verification (SEC-03)
+    if request.method in ["POST", "PUT", "DELETE", "PATCH"]:
         nonce = request.headers.get("X-Nonce")
-        timestamp_str = request.headers.get("X-Timestamp")
-        is_replay, replay_threat, replay_reasons = replay_guard.validate_request(nonce, timestamp_str, body_bytes)
+        idempotency_key = request.headers.get("Idempotency-Key")
+        timestamp_str = request.headers.get("X-Timestamp") or request.headers.get("Date")
+
+        # Public authentication, health checks, and management endpoints are exempt
+        is_freshness_exempt = (
+            request.url.path in ("/api/auth/login", "/health", "/health/live", "/health/ready")
+            or request.url.path.startswith("/api/compliance")
+            or request.url.path.startswith("/api/canary")
+            or request.url.path.startswith("/api/agents")
+            or request.url.path.startswith("/api/soc")
+        )
+        if not is_freshness_exempt:
+            if not (nonce or idempotency_key or timestamp_str):
+                return JSONResponse(
+                    status_code=400,
+                    headers={"X-Request-ID": request_id, "X-Decision": "BLOCK"},
+                    content={
+                        "error": "Bad Request",
+                        "request_id": request_id,
+                        "message": "State-mutating request requires freshness verification (X-Nonce, Idempotency-Key, or X-Timestamp)"
+                    }
+                )
+
+        is_replay, replay_threat, replay_reasons = replay_guard.validate_request(
+            nonce=nonce,
+            idempotency_key=idempotency_key,
+            timestamp_str=timestamp_str,
+            body_bytes=body_bytes
+        )
         if is_replay:
             reasons.extend(replay_reasons)
             waf_severity = max(waf_severity, replay_threat)
@@ -633,6 +674,29 @@ async def security_pipeline_middleware(request: Request, call_next):
         is_token_valid, auth_reason, claims, auth_anomaly, user_trust = auth_engine.decode_and_verify(auth_header)
         if not is_token_valid:
             reasons.append(auth_reason)
+            risk = calculate_risk(
+                waf_severity=waf_severity,
+                auth_anomaly=auth_anomaly,
+                rate_severity=0.0,
+                path=request.url.path,
+                extra_reasons=reasons
+            )
+            emit_audit_event(request_id, Decision.CHALLENGE, risk, request, (time.time() - start_time) * 1000, client_ip)
+            return JSONResponse(
+                status_code=401,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Decision": "CHALLENGE",
+                    "WWW-Authenticate": f'Bearer error="invalid_token", error_description="{auth_reason}"'
+                },
+                content={
+                    "error": "Unauthorized",
+                    "request_id": request_id,
+                    "message": auth_reason,
+                    "reasons": reasons,
+                    "risk_score": risk.overall
+                }
+            )
         else:
             user_principal = str(claims.get("sub", ""))
             # Phase 8: Principal Active Mitigation Check (Suspended Account, MFA Challenge)
