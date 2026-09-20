@@ -101,7 +101,8 @@ class DistributedStateStore:
         redis_timeout: Optional[float] = None,
         redis_client: Optional[Any] = None
     ):
-        self.redis_host = redis_host or config.redis_host
+        host = redis_host or config.redis_host
+        self.redis_host = "127.0.0.1" if host == "localhost" else host
         self.redis_port = redis_port or config.redis_port
         self.redis_timeout = redis_timeout or config.redis_timeout
         self.fallback = InMemoryStateStore()
@@ -113,16 +114,23 @@ class DistributedStateStore:
         if self._redis_client is not None and self._redis_available:
             return self._redis_client
         now = time.time()
-        if not self._redis_available and (now - self._last_check < 60):
+        if not self._redis_available and (now - self._last_check < 300):
             return None
         self._last_check = now
         try:
+            import socket
+            with socket.create_connection((self.redis_host, self.redis_port), timeout=0.05):
+                pass
             import redis
+            from redis.retry import Retry
+            from redis.backoff import NoBackoff
             r = redis.Redis(
                 host=self.redis_host,
                 port=self.redis_port,
                 socket_connect_timeout=0.05,
                 socket_timeout=self.redis_timeout,
+                retry_on_timeout=False,
+                retry=Retry(NoBackoff(), 0),
                 decode_responses=True
             )
             r.ping()

@@ -24,7 +24,9 @@ class InMemoryRateLimiter:
             return len(self._records[key])
 
 class RateLimiter:
-    def __init__(self, redis_host: str = "localhost", redis_port: int = 6379, redis_timeout: float = 0.5):
+    def __init__(self, redis_host: str = "127.0.0.1", redis_port: int = 6379, redis_timeout: float = 0.5):
+        if redis_host == "localhost":
+            redis_host = "127.0.0.1"
         self.redis_host = redis_host
         self.redis_port = redis_port
         self.redis_timeout = redis_timeout
@@ -41,12 +43,19 @@ class RateLimiter:
             return None
         self._last_check = now
         try:
+            import socket
+            with socket.create_connection((self.redis_host, self.redis_port), timeout=0.05):
+                pass
             import redis
+            from redis.retry import Retry
+            from redis.backoff import NoBackoff
             r = redis.Redis(
                 host=self.redis_host,
                 port=self.redis_port,
                 socket_connect_timeout=0.05,
                 socket_timeout=self.redis_timeout,
+                retry_on_timeout=False,
+                retry=Retry(NoBackoff(), 0),
                 decode_responses=True
             )
             r.ping()

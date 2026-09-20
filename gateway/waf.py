@@ -53,56 +53,159 @@ PATH_TRAVERSAL_PATTERNS = [
     re.compile(r"(/etc/passwd|/etc/shadow|/proc/self|/windows/system32|cmd\.exe)", re.IGNORECASE),
 ]
 
-def inspect_content(content: str) -> Tuple[bool, List[str], int]:
+import json
+from typing import Tuple, List, Any, Optional
+
+def _unescape_unicode_and_hex(s: str) -> str:
+    """Safely decodes \\uXXXX and \\xXX escape sequences to raw characters."""
+    def _replace_u(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return match.group(0)
+
+    def _replace_x(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return match.group(0)
+
+    res = re.sub(r"\\u([0-9a-fA-F]{4})", _replace_u, s)
+    res = re.sub(r"\\x([0-9a-fA-F]{2})", _replace_x, res)
+    return res
+
+
+def inspect_content(content: str, _recurse_json: bool = True) -> Tuple[bool, List[str], int]:
     """
     Inspects string content (paths, query strings, headers, body) for attack vectors.
+    Evaluates raw, URL-decoded, and Unicode/hex-unescaped variants to prevent evasion.
     Returns: (is_attack, list_of_reasons, threat_score 0-100)
     """
     if not content:
         return False, [], 0
-    
-    # Check both raw content and URL-decoded content
+
+    # Build comprehensive normalized variants
+    variants = [content]
     decoded = urllib.parse.unquote(content)
-    lower_raw = content.lower()
-    lower_decoded = decoded.lower()
-    
-    reasons = []
+    if decoded != content:
+        variants.append(decoded)
+        double_decoded = urllib.parse.unquote(decoded)
+        if double_decoded != decoded:
+            variants.append(double_decoded)
+
+    # Unicode & hex escape unescaping (SEC-07 evasion protection)
+    for text in list(variants):
+        unescaped = _unescape_unicode_and_hex(text)
+        if unescaped not in variants:
+            variants.append(unescaped)
+            unescaped_decoded = urllib.parse.unquote(unescaped)
+            if unescaped_decoded not in variants:
+                variants.append(unescaped_decoded)
+
+    reasons: List[str] = []
     threat_score = 0
-    
-    # 1. SQL Injection Check
-    for sub in SQLI_SUBSTRINGS:
-        if sub in lower_raw or sub in lower_decoded:
-            reasons.append(f"SQL injection literal detected: '{sub}'")
-            threat_score = max(threat_score, 95)
+
+    # 1. SQL Injection Check across all variants
+    for variant in variants:
+        lower_v = variant.lower()
+        for sub in SQLI_SUBSTRINGS:
+            if sub in lower_v:
+                reasons.append(f"SQL injection literal detected: '{sub}'")
+                threat_score = max(threat_score, 95)
+                break
+        if threat_score >= 95:
             break
-            
+
     if threat_score < 90:
-        for pat in SQLI_PATTERNS:
-            if pat.search(content) or pat.search(decoded):
-                reasons.append(f"SQL injection regex pattern match: {pat.pattern}")
+        for variant in variants:
+            for pat in SQLI_PATTERNS:
+                if pat.search(variant):
+                    reasons.append(f"SQL injection regex pattern match: {pat.pattern}")
+                    threat_score = max(threat_score, 90)
+                    break
+            if threat_score >= 90:
+                break
+
+    # 2. XSS Check across all variants
+    for variant in variants:
+        lower_v = variant.lower()
+        for sub in XSS_SUBSTRINGS:
+            if sub in lower_v:
+                reasons.append(f"XSS literal detected: '{sub}'")
                 threat_score = max(threat_score, 90)
                 break
-
-    # 2. XSS Check
-    for sub in XSS_SUBSTRINGS:
-        if sub in lower_raw or sub in lower_decoded:
-            reasons.append(f"XSS literal detected: '{sub}'")
-            threat_score = max(threat_score, 90)
+        if threat_score >= 90:
             break
-            
+
     if threat_score < 85:
-        for pat in XSS_PATTERNS:
-            if pat.search(content) or pat.search(decoded):
-                reasons.append(f"XSS regex pattern match: {pat.pattern}")
-                threat_score = max(threat_score, 85)
+        for variant in variants:
+            for pat in XSS_PATTERNS:
+                if pat.search(variant):
+                    reasons.append(f"XSS regex pattern match: {pat.pattern}")
+                    threat_score = max(threat_score, 85)
+                    break
+            if threat_score >= 85:
                 break
 
-    # 3. Path Traversal Check
-    for pat in PATH_TRAVERSAL_PATTERNS:
-        if pat.search(content) or pat.search(decoded):
-            reasons.append("Path traversal attempt detected")
-            threat_score = max(threat_score, 95)
+    # 3. Path Traversal Check across all variants
+    for variant in variants:
+        for pat in PATH_TRAVERSAL_PATTERNS:
+            if pat.search(variant):
+                reasons.append("Path traversal attempt detected")
+                threat_score = max(threat_score, 95)
+                break
+        if threat_score >= 95:
             break
-            
-    is_attack = len(reasons) > 0
-    return is_attack, reasons, min(100, threat_score)
+
+    # 4. JSON Content Inspection (if body is a serialized JSON object/array)
+    if _recurse_json:
+        stripped = content.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed_json = json.loads(stripped)
+                is_json_attack, json_reasons, json_score = inspect_payload(parsed_json)
+                if is_json_attack:
+                    reasons.extend(json_reasons)
+                    threat_score = max(threat_score, json_score)
+            except Exception:
+                pass
+
+    dedup_reasons = list(dict.fromkeys(reasons))
+    is_attack = len(dedup_reasons) > 0
+    return is_attack, dedup_reasons, min(100, threat_score)
+
+
+def inspect_payload(payload: Any) -> Tuple[bool, List[str], int]:
+    """
+    Recursively inspects dictionary, list, or primitive JSON payloads for injection attacks.
+    Inspects all dictionary keys and string values with Unicode & URL unescaping.
+    """
+    if payload is None:
+        return False, [], 0
+
+    reasons: List[str] = []
+    max_threat = 0
+
+    def _traverse(item: Any) -> None:
+        nonlocal max_threat
+        if isinstance(item, dict):
+            for k, v in item.items():
+                if isinstance(k, str):
+                    is_att, r, sc = inspect_content(k, _recurse_json=False)
+                    if is_att:
+                        reasons.extend(r)
+                        max_threat = max(max_threat, sc)
+                _traverse(v)
+        elif isinstance(item, (list, tuple, set)):
+            for elem in item:
+                _traverse(elem)
+        elif isinstance(item, str):
+            is_att, r, sc = inspect_content(item, _recurse_json=False)
+            if is_att:
+                reasons.extend(r)
+                max_threat = max(max_threat, sc)
+
+    _traverse(payload)
+    dedup_reasons = list(dict.fromkeys(reasons))
+    return len(dedup_reasons) > 0, dedup_reasons, min(100, max_threat)
+

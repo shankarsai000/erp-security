@@ -92,20 +92,32 @@ class TrafficMetrics:
             self._error_count = 0
 
 
+DEFAULT_ROUTE_SLOS: Dict[str, Dict[str, float]] = {
+    "read_default": {"max_p95_ms": 50.0, "max_error_rate": 0.02},
+    "mutation_default": {"max_p95_ms": 250.0, "max_error_rate": 0.01},
+    "/api/orders": {"max_p95_ms": 250.0, "max_error_rate": 0.01},
+    "/api/inventory/replenish": {"max_p95_ms": 250.0, "max_error_rate": 0.01},
+    "/api/inventory": {"max_p95_ms": 50.0, "max_error_rate": 0.02},
+    "/api/users": {"max_p95_ms": 50.0, "max_error_rate": 0.02},
+}
+
+
 class CanaryRouter:
     """
     Enterprise Canary Router.
     Controls progressive rollout, deterministic sticky routing,
     and automatic emergency rollback when SLO limits are violated.
+    Supports route-aware latency and error budgets (OPS-01).
     """
 
     def __init__(
         self,
         initial_stage: CanaryStage = CanaryStage.DISABLED,
-        max_error_rate: float = 0.02,       # 2% error rate threshold triggers rollback
-        max_p95_latency_ms: float = 50.0,    # 50ms SLA budget
+        max_error_rate: float = 0.02,       # 2% global error rate threshold
+        max_p95_latency_ms: float = 50.0,    # 50ms default read SLA budget
         min_eval_samples: int = 15,          # Minimum canary requests before evaluating rollback
-        auto_rollback_enabled: bool = True
+        auto_rollback_enabled: bool = True,
+        route_slos: Optional[Dict[str, Dict[str, float]]] = None
     ):
         self.stage = initial_stage
         self.weight = STAGE_WEIGHT_MAP.get(initial_stage, 0.0)
@@ -113,13 +125,42 @@ class CanaryRouter:
         self.max_p95_latency_ms = max_p95_latency_ms
         self.min_eval_samples = min_eval_samples
         self.auto_rollback_enabled = auto_rollback_enabled
+        self.route_slos = dict(DEFAULT_ROUTE_SLOS if route_slos is None else route_slos)
 
         self.stable_metrics = TrafficMetrics(window_size=500)
         self.canary_metrics = TrafficMetrics(window_size=500)
+        self.canary_route_metrics: Dict[str, TrafficMetrics] = {}
 
         self.last_rollback_reason: Optional[str] = None
         self.last_rollback_timestamp: Optional[float] = None
         self._lock = threading.Lock()
+
+    def get_route_budget(self, path: Optional[str] = None, method: str = "GET") -> Tuple[float, float]:
+        """
+        Returns (max_p95_ms, max_error_rate) for the given route and method (OPS-01).
+        Complex mutation paths (e.g. /api/orders) have 250ms SLA; read paths have 50ms SLA.
+        """
+        if path:
+            for route_prefix, budget in self.route_slos.items():
+                if route_prefix.startswith("/") and path.startswith(route_prefix):
+                    return budget.get("max_p95_ms", self.max_p95_latency_ms), budget.get("max_error_rate", self.max_error_rate)
+
+        if method in ("POST", "PUT", "PATCH", "DELETE"):
+            mut_budget = self.route_slos.get("mutation_default", {})
+            return mut_budget.get("max_p95_ms", 250.0), mut_budget.get("max_error_rate", 0.01)
+
+        read_budget = self.route_slos.get("read_default", {})
+        return read_budget.get("max_p95_ms", self.max_p95_latency_ms), read_budget.get("max_error_rate", self.max_error_rate)
+
+    def _get_route_key(self, path: str, method: str) -> str:
+        """Normalizes path to route category for metric tracking."""
+        prefix = path.split("?")[0].rstrip("/")
+        parts = prefix.split("/")
+        if len(parts) > 3 and parts[2] == "orders":
+            return f"{method} /api/orders"
+        if len(parts) > 3 and parts[2] == "users":
+            return f"{method} /api/users"
+        return f"{method} {prefix}"
 
     def set_weight(self, weight: float) -> None:
         """Sets an arbitrary canary weight clamped to [0.0, 1.0]."""
@@ -143,6 +184,7 @@ class CanaryRouter:
             self.stage = stage
             self.weight = STAGE_WEIGHT_MAP.get(stage, 0.0)
             self.canary_metrics.reset()
+            self.canary_route_metrics.clear()
             logger.info("Canary promoted to stage %s (weight: %.2f)", self.stage, self.weight)
             return {
                 "status": "PROMOTED",
@@ -215,39 +257,80 @@ class CanaryRouter:
         # Otherwise fallback to uniform random
         return random.random() < weight
 
-    def record_metric(self, is_canary: bool, latency_ms: float, status_code: int) -> None:
+    def record_metric(
+        self,
+        is_canary: bool,
+        latency_ms: float,
+        status_code: int,
+        path: Optional[str] = None,
+        method: str = "GET"
+    ) -> None:
         """
         Records telemetry for the request and validates SLO compliance.
+        Supports route-specific tagging for differentiated budgets (OPS-01).
         If canary breaches error rate or latency limits, automated rollback fires.
         """
         is_error = status_code >= 500
 
         if is_canary:
             self.canary_metrics.record(latency_ms, is_error)
+            if path:
+                route_key = self._get_route_key(path, method)
+                with self._lock:
+                    if route_key not in self.canary_route_metrics:
+                        self.canary_route_metrics[route_key] = TrafficMetrics(window_size=500)
+                    metric = self.canary_route_metrics[route_key]
+                metric.record(latency_ms, is_error)
+
             if self.auto_rollback_enabled:
-                self._evaluate_canary_slo()
+                self._evaluate_canary_slo(path=path, method=method)
         else:
             self.stable_metrics.record(latency_ms, is_error)
 
-    def _evaluate_canary_slo(self) -> None:
-        """Evaluates canary error rate and p95 latency against enterprise thresholds."""
+    def _evaluate_canary_slo(self, path: Optional[str] = None, method: str = "GET") -> None:
+        """Evaluates canary error rate and p95 latency against enterprise and route thresholds."""
+        budget_p95, budget_err = self.get_route_budget(path, method) if path else (self.max_p95_latency_ms, self.max_error_rate)
+
+        # 1. Route-specific evaluation if route metrics exist
+        if path:
+            route_key = self._get_route_key(path, method)
+            with self._lock:
+                route_metric = self.canary_route_metrics.get(route_key)
+            if route_metric:
+                r_stats = route_metric.get_stats()
+                if r_stats["window_samples"] >= min(self.min_eval_samples, 15):
+                    if r_stats["error_rate"] > budget_err:
+                        self.rollback(
+                            f"Canary route '{route_key}' error rate {r_stats['error_rate'] * 100:.1f}% exceeded budget {budget_err * 100:.1f}%"
+                        )
+                        return
+                    if r_stats["p95_latency_ms"] > budget_p95:
+                        self.rollback(
+                            f"Canary route '{route_key}' p95 latency {r_stats['p95_latency_ms']:.1f}ms breached SLA limit {budget_p95:.1f}ms"
+                        )
+                        return
+
+        # 2. Aggregate canary metrics evaluation
         stats = self.canary_metrics.get_stats()
         samples = stats["window_samples"]
 
-        # Only evaluate once minimum sample threshold is reached
         if samples < self.min_eval_samples:
             return
 
         err_rate = stats["error_rate"]
         p95_lat = stats["p95_latency_ms"]
 
-        if err_rate > self.max_error_rate:
+        # When evaluating aggregate metrics, use the effective threshold
+        effective_err_limit = max(self.max_error_rate, budget_err) if path else self.max_error_rate
+        effective_p95_limit = max(self.max_p95_latency_ms, budget_p95) if path else self.max_p95_latency_ms
+
+        if err_rate > effective_err_limit:
             self.rollback(
-                f"Canary error rate {err_rate * 100:.1f}% exceeded limit {self.max_error_rate * 100:.1f}%"
+                f"Canary error rate {err_rate * 100:.1f}% exceeded limit {effective_err_limit * 100:.1f}%"
             )
-        elif p95_lat > self.max_p95_latency_ms:
+        elif p95_lat > effective_p95_limit:
             self.rollback(
-                f"Canary p95 latency {p95_lat:.1f}ms breached SLA limit {self.max_p95_latency_ms:.1f}ms"
+                f"Canary p95 latency {p95_lat:.1f}ms breached SLA limit {effective_p95_limit:.1f}ms"
             )
 
     def get_status(self) -> Dict[str, Any]:
@@ -261,6 +344,7 @@ class CanaryRouter:
                     "max_error_rate": self.max_error_rate,
                     "max_p95_latency_ms": self.max_p95_latency_ms,
                     "min_eval_samples": self.min_eval_samples,
+                    "route_slos": self.route_slos,
                 },
                 "last_rollback": {
                     "reason": self.last_rollback_reason,
@@ -273,3 +357,4 @@ class CanaryRouter:
 
 # Global Singleton Canary Router
 canary_router = CanaryRouter()
+

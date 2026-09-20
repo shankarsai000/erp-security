@@ -24,7 +24,7 @@ from gateway.telemetry.anti_poisoning import anti_poisoning_filter
 
 from gateway.telemetry.event_pipeline import telemetry_pipeline
 from gateway.telemetry.redaction import pseudonymize_identifier, sanitize_telemetry, mask_ip
-from gateway.waf import inspect_content
+from gateway.waf import inspect_content, inspect_payload
 
 
 def get_verified_client_ip(request: Request) -> str:
@@ -518,6 +518,12 @@ async def security_pipeline_middleware(request: Request, call_next):
         return {"type": "http.request", "body": body_bytes}
     request._receive = receive
     body_text = body_bytes.decode("utf-8", errors="ignore") if body_bytes else ""
+    payload_dict = None
+    if body_text:
+        try:
+            payload_dict = json.loads(body_text)
+        except Exception:
+            payload_dict = None
 
     # 3. Credential Defense Status Check (Brute-force velocity lockout)
     is_brute_force, cred_threat, cred_reasons = credential_defense.check_status(client_ip)
@@ -537,20 +543,28 @@ async def security_pipeline_middleware(request: Request, call_next):
             content={"error": "Forbidden", "request_id": request_id, "message": "Access temporarily locked due to repeated authentication failures", "reasons": reasons}
         )
 
-    # 4. WAF Inspection (Inspect raw URL and body for SQLi, XSS, Path Traversal)
+    # 4. WAF Inspection (Inspect raw URL, body text, and parsed JSON payload for SQLi, XSS, Path Traversal)
     waf_severity = float(cred_threat)
     is_path_attack, path_reasons, path_score = inspect_content(str(request.url))
     if is_path_attack:
         waf_severity = max(waf_severity, float(path_score))
         reasons.extend(path_reasons)
         
+    is_body_attack = False
     if body_text:
         is_body_attack, body_reasons, body_score = inspect_content(body_text)
         if is_body_attack:
             waf_severity = max(waf_severity, float(body_score))
             reasons.extend(body_reasons)
 
-    if is_path_attack or (body_text and is_body_attack):
+    is_payload_attack = False
+    if payload_dict:
+        is_payload_attack, payload_reasons, payload_score = inspect_payload(payload_dict)
+        if is_payload_attack:
+            waf_severity = max(waf_severity, float(payload_score))
+            reasons.extend(payload_reasons)
+
+    if is_path_attack or (body_text and is_body_attack) or is_payload_attack:
         risk = calculate_risk(
             waf_severity=waf_severity,
             auth_anomaly=0.0,
@@ -922,7 +936,7 @@ async def security_pipeline_middleware(request: Request, call_next):
         )
         proxy_latency_ms = (time.time() - proxy_start_time) * 1000
         circuit_breaker.record_success()
-        canary_router.record_metric(is_canary, proxy_latency_ms, upstream_resp.status_code)
+        canary_router.record_metric(is_canary, proxy_latency_ms, upstream_resp.status_code, path=request.url.path, method=request.method)
         
         # Track failed logins for brute force defense
         if request.url.path == "/api/auth/login" and upstream_resp.status_code == 401:
@@ -955,7 +969,7 @@ async def security_pipeline_middleware(request: Request, call_next):
                 content=body_bytes
             )
             circuit_breaker.record_success()
-            canary_router.record_metric(is_canary, proxy_latency_ms, upstream_resp.status_code)
+            canary_router.record_metric(is_canary, proxy_latency_ms, upstream_resp.status_code, path=request.url.path, method=request.method)
             response = Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
@@ -967,7 +981,7 @@ async def security_pipeline_middleware(request: Request, call_next):
             response.headers["X-Gateway-Route"] = "canary" if is_canary else "stable"
             return response
         circuit_breaker.record_failure(str(exc))
-        canary_router.record_metric(is_canary, proxy_latency_ms, 502)
+        canary_router.record_metric(is_canary, proxy_latency_ms, 502, path=request.url.path, method=request.method)
         logger.error(f"RuntimeError proxying request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,
@@ -981,7 +995,7 @@ async def security_pipeline_middleware(request: Request, call_next):
     except Exception as exc:
         proxy_latency_ms = (time.time() - proxy_start_time) * 1000
         circuit_breaker.record_failure(str(exc))
-        canary_router.record_metric(is_canary, proxy_latency_ms, 502)
+        canary_router.record_metric(is_canary, proxy_latency_ms, 502, path=request.url.path, method=request.method)
         logger.error(f"Failed to proxy request {request_id} to {upstream_url}: {exc}")
         return JSONResponse(
             status_code=502,

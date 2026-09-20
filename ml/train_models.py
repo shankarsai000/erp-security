@@ -249,3 +249,53 @@ def generate_synthetic_anomalies(count: int = 50) -> List[dict]:
         })
     return anomalies
 
+
+def generate_large_clean_baseline_dataset(count: int = 2000) -> List[dict]:
+    """
+    Generates a high-volume realistic clean dataset across diverse ERP business operations (ML-01).
+    Used to establish robust Isolation Forest baseline decision boundaries with low FPR.
+    """
+    rng = np.random.default_rng(12345)
+    endpoints = [
+        "/api/orders",
+        "/api/orders/101",
+        "/api/orders/102",
+        "/api/inventory/items",
+        "/api/inventory",
+        "/api/finance/invoices",
+        "/api/users/1",
+        "/api/users/profile"
+    ]
+    users = [f"user_{i:04d}" for i in range(1, 50)]
+    events = []
+    base_time = datetime(2026, 9, 1, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+
+    for i in range(count):
+        uid = str(rng.choice(users))
+        path = str(rng.choice(endpoints))
+        is_order = "orders" in path
+        method = "POST" if is_order and rng.random() < 0.3 else "GET"
+        # Naturally distributed latency and payload size
+        base_latency = 35.0 if method == "POST" else 8.0
+        lat = float(max(1.0, rng.normal(base_latency, 5.0)))
+        size = int(max(64, rng.normal(512 if method == "POST" else 128, 80)))
+        ts = datetime.fromtimestamp(base_time + i * 15.0, tz=timezone.utc).isoformat()
+
+        events.append({
+            "timestamp": ts,
+            "user_id": uid,
+            "principal_ref": uid,
+            "path": path,
+            "method": method,
+            "request_size_bytes": size,
+            "latency_ms": round(lat, 2),
+            "user_account_age_days": int(rng.integers(15, 900)),
+            "user_incident_count": 0,
+            "client_ip": f"192.168.1.{rng.integers(10, 200)}",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "decision": "ALLOW",
+            "risk_score": float(round(rng.uniform(2.0, 12.0), 2))
+        })
+
+    return events
+

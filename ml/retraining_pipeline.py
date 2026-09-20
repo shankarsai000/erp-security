@@ -98,6 +98,56 @@ class ConceptDriftDetector:
         return report
 
 
+import threading
+import time
+
+
+class AlertDeduplicator:
+    """
+    Clusters and deduplicates high-frequency anomaly alerts to prevent SOC alert fatigue (ML-01).
+    Groups repetitive alerts by entity (principal, IP, or endpoint) within a sliding window.
+    """
+
+    def __init__(self, window_seconds: float = 60.0, max_alerts_per_window: int = 3):
+        self.window_seconds = window_seconds
+        self.max_alerts_per_window = max_alerts_per_window
+        self._history: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def should_alert(self, entity_key: str, alert_type: str = "ANOMALY") -> Tuple[bool, int]:
+        """
+        Determines if an alert for the given entity should be forwarded or clustered.
+        Returns: (should_forward, suppressed_count)
+        """
+        now = time.time()
+        composite_key = f"{alert_type}:{entity_key}"
+        with self._lock:
+            timestamps = self._history.get(composite_key, [])
+            cutoff = now - self.window_seconds
+            active = [t for t in timestamps if t > cutoff]
+            active.append(now)
+            self._history[composite_key] = active
+
+            count = len(active)
+            if count <= self.max_alerts_per_window:
+                return True, 0
+
+            suppressed = count - self.max_alerts_per_window
+            return False, suppressed
+
+    def get_cluster_stats(self) -> Dict[str, Any]:
+        """Returns statistics on active alert clusters and suppression."""
+        with self._lock:
+            return {
+                "active_clusters": len(self._history),
+                "tracked_entities": list(self._history.keys())
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._history.clear()
+
+
 @dataclass
 class RetrainingResult:
     """Outcome of model retraining and promotion evaluation."""
@@ -117,14 +167,16 @@ class RetrainingResult:
 class ModelRetrainingPipeline:
     """Automates model retraining, concept drift gating, and strict FPR/FNR promotion."""
 
-    MAX_PERMITTED_FPR: float = 0.02  # Max 2% False Positive Rate
+    MAX_PERMITTED_FPR: float = 0.01  # Max 1% False Positive Rate (ML-01)
     MAX_PERMITTED_FNR: float = 0.05  # Max 5% False Negative Rate
 
-    def __init__(self, model_dir: str = "ml/models"):
+    def __init__(self, model_dir: str = "ml/models", max_permitted_fpr: Optional[float] = None):
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.drift_detector = ConceptDriftDetector()
         self.trainer = ModelTrainingPipeline(model_dir=str(self.model_dir))
+        self.max_permitted_fpr = max_permitted_fpr if max_permitted_fpr is not None else self.MAX_PERMITTED_FPR
+        self.alert_deduplicator = AlertDeduplicator()
 
     def run_retraining_cycle(
         self,
@@ -132,7 +184,7 @@ class ModelRetrainingPipeline:
         X_validation_normal: np.ndarray,
         X_validation_anomalous: np.ndarray,
         X_reference_baseline: Optional[np.ndarray] = None,
-        contamination: float = 0.01
+        contamination: float = 0.001
     ) -> RetrainingResult:
         """Executes full retraining and promotion gating cycle."""
         # 1. Concept Drift Check (if reference data provided)
@@ -147,7 +199,7 @@ class ModelRetrainingPipeline:
         # 2. Train candidate model on clean training data
         model, scaler = self.trainer.train_isolation_forest(
             X_train=X_clean_train,
-            contamination=contamination,  # Default 1% contamination ensures FPR <= 2%
+            contamination=contamination,  # Low contamination ensures strict FPR <= 1.0% (ML-01)
             n_estimators=50
         )
 
@@ -161,7 +213,7 @@ class ModelRetrainingPipeline:
         fnr = metrics.get("false_negative_rate", 0.0)
 
         # 4. Enforce Strict Promotion Gates
-        passed_fpr = fpr <= self.MAX_PERMITTED_FPR
+        passed_fpr = fpr <= self.max_permitted_fpr
         passed_fnr = fnr <= self.MAX_PERMITTED_FNR
         promotion_granted = passed_fpr and passed_fnr
 

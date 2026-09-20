@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-09-20T17:01:19.864554+00:00",
+  "target": "http://127.0.0.1:16215",
+  "concurrency": 4,
+  "total_requests": 40,
+  "successful_requests": 40,
+  "success_rate": 1.0,
+  "total_duration_seconds": 1.465,
+  "requests_per_second": 27.3,
+  "latency_stats_ms": {
+    "min": 11.36,
+    "p50": 53.79,
+    "p95": 72.52,
+    "p99": 74.51,
+    "max": 74.51,
+    "read_p95": 72.52
+  },
+  "sla_verification": {
+    "read_p95_under_80ms": true,
+    "overall_success_over_99pct": true,
+    "sla_passed": true
+  }
+}
