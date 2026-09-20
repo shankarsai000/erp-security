@@ -1,0 +1,68 @@
+name: CI / Enterprise Production Security Gate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-audit:
+    name: Pytest Suite & Production Readiness Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Full Automated Test Suite (193 Tests)
+        run: |
+          python -m pytest tests -q --tb=short
+
+      - name: Run Enterprise Production Readiness Auditor (12/12 Phases)
+        run: |
+          python scripts/verify_production_readiness.py
+
+      - name: Run Live TCP Socket Benchmark & SLA Verification
+        run: |
+          python benchmarks/socket_benchmark.py
+
+      - name: Upload Audit Reports & Benchmark Scorecards
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-and-benchmark-reports
+          path: |
+            reports/production_readiness_scorecard.json
+            reports/socket_benchmark_report.json
+
+  docker-validate:
+    name: Docker Container & Compose Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose Configuration
+        run: |
+          docker compose config
+
+      - name: Build Gateway & Backend Container Images
+        run: |
+          docker compose build

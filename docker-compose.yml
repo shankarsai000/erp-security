@@ -22,16 +22,28 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./events:/app/events
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
       - GATEWAY_HOST=0.0.0.0
       - GATEWAY_PORT=8000
-      - BACKEND_URL=http://fake_erp:8001
+      - BACKEND_URL=${BACKEND_URL:-http://fake_erp:8001}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - LOG_LEVEL=INFO
+      - REDIS_TIMEOUT=0.5
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-erp_dev_jwt_secret_key_minimum_32_bytes_long_2026!}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - COMPLIANCE_SIGNING_SECRET=${COMPLIANCE_SIGNING_SECRET:-erp_gateway_enterprise_tamper_evident_secret_key_2026}
+      - TELEMETRY_SALT=${TELEMETRY_SALT:-erp_dev_telemetry_pseudonym_salt_2026!}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      - INTERNAL_IP_WHITELIST=${INTERNAL_IP_WHITELIST:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost}
     depends_on:
-      - redis
-      - fake_erp
+      redis:
+        condition: service_healthy
+      fake_erp:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'"]
       interval: 5s
@@ -59,6 +71,11 @@ services:
     ports:
       - "6379:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   nginx_logs:

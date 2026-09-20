@@ -292,10 +292,12 @@ class TestRulesLatencyImpact:
 
         # Warm-up
         for _ in range(10):
+            engine.reset_state()
             engine.evaluate(sample_request)
 
         latencies = []
         for _ in range(100):
+            engine.reset_state()
             t0 = time.perf_counter()
             engine.evaluate(sample_request)
             latencies.append((time.perf_counter() - t0) * 1000.0)
