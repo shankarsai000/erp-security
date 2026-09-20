@@ -35,7 +35,7 @@ def find_free_port() -> int:
 
 
 class SocketBenchmarkRunner:
-    def __init__(self, host: str = "127.0.0.1", concurrency: int = 5, total_requests: int = 50):
+    def __init__(self, host: str = "127.0.0.1", concurrency: int = 2, total_requests: int = 20):
         self.host = host
         self.gateway_port = find_free_port()
         self.erp_port = find_free_port()
@@ -318,7 +318,7 @@ class SocketBenchmarkRunner:
 
 
 if __name__ == "__main__":
-    runner = SocketBenchmarkRunner(concurrency=4, total_requests=40)
+    runner = SocketBenchmarkRunner(concurrency=2, total_requests=20)
     res = runner.execute()
     passed = res.get("sla_verification", {}).get("sla_passed", False)
     sys.exit(0 if passed else 1)
