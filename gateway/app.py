@@ -447,9 +447,10 @@ async def security_pipeline_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = request_id
     
-    # Health and management endpoints bypass proxying and security pipeline
+    # Health, documentation, and management endpoints bypass proxying and security pipeline
     if (
         request.url.path in (
+            "/docs", "/openapi.json", "/redoc",
             "/health", "/health/live", "/health/ready",
             "/api/ml/health", "/api/ml/rollback", "/api/ml/recover",
             "/api/mitigations/status", "/api/ml/retrain", "/api/metrics/security",

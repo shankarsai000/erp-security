@@ -27,6 +27,9 @@ class RouteAllowlist:
     def __init__(self, config_path: Optional[str] = None):
         self.routes: List[RouteRule] = [
             RouteRule("/health", ["GET"], auth_required=False),
+            RouteRule("/docs", ["GET"], auth_required=False),
+            RouteRule("/openapi.json", ["GET"], auth_required=False),
+            RouteRule("/redoc", ["GET"], auth_required=False),
             RouteRule("/api/auth/login", ["POST"], auth_required=False),
             RouteRule("/api/orders", ["GET", "POST"], auth_required=True, roles=["sales", "manager", "admin"]),
             RouteRule("/api/orders/{id}", ["GET", "PUT", "DELETE"], auth_required=True, roles=["sales", "manager", "admin"]),
