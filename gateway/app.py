@@ -678,7 +678,7 @@ async def security_pipeline_middleware(request: Request, call_next):
 
     # 8. Cryptographic JWT & BOLA/IDOR Authorization
     auth_header = request.headers.get("Authorization", "")
-    is_auth_exempt = request.url.path in ["/health", "/api/auth/login"]
+    is_auth_exempt = (matching_rule and not matching_rule.auth_required) or request.url.path in ["/health", "/api/auth/login"]
     user_principal = ""
     
     if is_auth_exempt:
@@ -914,7 +914,7 @@ async def security_pipeline_middleware(request: Request, call_next):
     forward_headers["X-Decision"] = risk_score.decision.value
     forward_headers["X-Risk-Score"] = str(risk_score.overall)
     # Strip transport headers
-    for h in ["host", "content-length", "transfer-encoding"]:
+    for h in ["host", "content-length", "transfer-encoding", "accept-encoding"]:
         forward_headers.pop(h, None)
 
     # Phase 11: Canary Traffic Decision
@@ -925,6 +925,12 @@ async def security_pipeline_middleware(request: Request, call_next):
     )
     forward_headers["X-Gateway-Route"] = "canary" if is_canary else "stable"
     proxy_start_time = time.time()
+
+    def _sanitize_resp_headers(raw_headers: dict) -> dict:
+        h = dict(raw_headers)
+        for transport_header in ["content-encoding", "content-length", "transfer-encoding", "connection"]:
+            h.pop(transport_header, None)
+        return h
 
     try:
         client = get_http_client()
@@ -949,7 +955,7 @@ async def security_pipeline_middleware(request: Request, call_next):
         response = Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
-            headers=dict(upstream_resp.headers)
+            headers=_sanitize_resp_headers(upstream_resp.headers)
         )
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Decision"] = risk_score.decision.value
@@ -973,7 +979,7 @@ async def security_pipeline_middleware(request: Request, call_next):
             response = Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
-                headers=dict(upstream_resp.headers)
+                headers=_sanitize_resp_headers(upstream_resp.headers)
             )
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Decision"] = risk_score.decision.value

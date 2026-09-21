@@ -3,6 +3,17 @@
 # Supports wildcard suffixes like '/*' for hierarchical path matching.
 
 routes:
+  # Upstream Target: Gujarat Maritime University (GMU) Web / ERP Portal
+  - path: "/"
+    methods: ["GET"]
+    auth_required: false
+    roles: []
+
+  - path: "/*"
+    methods: ["GET"]
+    auth_required: false
+    roles: []
+
   # Example: SAP OData / Gateway endpoints
   - path: "/sap/opu/odata/*"
     methods: ["GET", "POST", "PUT", "PATCH"]
@@ -20,9 +31,3 @@ routes:
     methods: ["GET", "POST", "PATCH", "DELETE"]
     auth_required: true
     roles: ["sales", "manager", "admin"]
-
-  # Example: Custom / Legacy Enterprise ERP Endpoints
-  # - path: "/api/v1/customers"
-  #   methods: ["GET"]
-  #   auth_required: true
-  #   roles: ["sales", "admin"]

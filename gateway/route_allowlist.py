@@ -72,7 +72,12 @@ class RouteAllowlist:
         """
         method = method.upper()
         matching_rule = None
-        for rule in self.routes:
+        # Sort routes so exact/longer patterns are matched before broad wildcards like '/*'
+        sorted_routes = sorted(
+            self.routes,
+            key=lambda r: (1 if r.raw_pattern.endswith("/*") else 0, -len(r.raw_pattern))
+        )
+        for rule in sorted_routes:
             if rule.matches(path):
                 matching_rule = rule
                 break

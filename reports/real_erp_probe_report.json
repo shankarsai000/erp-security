@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-09-21T04:28:24.981423+00:00",
+  "timestamp": "2026-09-21T04:33:40.925867+00:00",
   "target": {
     "base_url": "http://127.0.0.1:59998",
     "scheme": "http",
@@ -14,7 +14,7 @@
       "resolved_ips": [
         "127.0.0.1"
       ],
-      "duration_ms": 0.06
+      "duration_ms": 0.15
     },
     "tcp": {
       "status": "FAIL",
@@ -29,7 +29,7 @@
     "http": {
       "status": "FAIL",
       "error": "timed out",
-      "duration_ms": 860.86
+      "duration_ms": 2156.3
     }
   },
   "latency_ms": {},
