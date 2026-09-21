@@ -1,0 +1,28 @@
+# ERP Security Gateway: Dynamic API Catalog & Custom Route Allowlist
+# Define additional upstream ERP endpoints here.
+# Supports wildcard suffixes like '/*' for hierarchical path matching.
+
+routes:
+  # Example: SAP OData / Gateway endpoints
+  - path: "/sap/opu/odata/*"
+    methods: ["GET", "POST", "PUT", "PATCH"]
+    auth_required: true
+    roles: ["sales", "finance", "admin"]
+
+  # Example: Oracle NetSuite SuiteTalk REST Web Services
+  - path: "/services/rest/record/v1/*"
+    methods: ["GET", "POST", "PATCH"]
+    auth_required: true
+    roles: ["sales", "manager", "admin"]
+
+  # Example: Microsoft Dynamics 365 Web API
+  - path: "/api/data/v9.2/*"
+    methods: ["GET", "POST", "PATCH", "DELETE"]
+    auth_required: true
+    roles: ["sales", "manager", "admin"]
+
+  # Example: Custom / Legacy Enterprise ERP Endpoints
+  # - path: "/api/v1/customers"
+  #   methods: ["GET"]
+  #   auth_required: true
+  #   roles: ["sales", "admin"]
